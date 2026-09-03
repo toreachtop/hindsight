@@ -3791,9 +3791,7 @@ class HindsightConfig:
             == "true",
             embeddings_tei_url=os.getenv(ENV_EMBEDDINGS_TEI_URL),
             embeddings_ollama_model=os.getenv(ENV_EMBEDDINGS_OLLAMA_MODEL, DEFAULT_EMBEDDINGS_OLLAMA_MODEL),
-            embeddings_ollama_base_url=os.getenv(
-                ENV_EMBEDDINGS_OLLAMA_BASE_URL, DEFAULT_EMBEDDINGS_OLLAMA_BASE_URL
-            ),
+            embeddings_ollama_base_url=os.getenv(ENV_EMBEDDINGS_OLLAMA_BASE_URL, DEFAULT_EMBEDDINGS_OLLAMA_BASE_URL),
             embeddings_openai_base_url=os.getenv(ENV_EMBEDDINGS_OPENAI_BASE_URL) or None,
             embeddings_openai_batch_size=_parse_positive_int(
                 ENV_EMBEDDINGS_OPENAI_BATCH_SIZE,
