@@ -502,6 +502,7 @@ async def _insert_facts_and_links(
     memory_links here.
     """
     set_stage("retain.phase2.insert_facts")
+    # 新增插入-memory_units
     unit_ids = await fact_storage.insert_facts_batch(conn, bank_id, processed_facts, ops=ops, txn=txn)
     step_start = time.time()
     log_buffer.append(f"  Insert facts: {len(unit_ids)} units in {time.time() - step_start:.3f}s")
@@ -526,12 +527,14 @@ async def _insert_facts_and_links(
         # Lock/re-create the resolved parents on THIS transaction before linking,
         # closing the window where prune_orphan_entities could have deleted one
         # between Phase-1 resolution and this insert (#2662).
+        # 批次内-新增插入- unit_entities 实体与memory_units的关联
         await entity_resolver.reassert_entities_batch(bank_id, resolved_entities, conn=conn)
         await entity_resolver.link_units_to_entities_batch(unit_entity_pairs, conn=conn, bank_id=bank_id)
         log_buffer.append(f"  Insert unit_entities: {len(unit_entity_pairs)} pairs in {time.time() - step_start:.3f}s")
 
         # Create temporal links
         step_start = time.time()
+        # 批次内-新增时序关联
         temporal_link_count = await link_creation.create_temporal_links_batch(conn, bank_id, unit_ids, ops=ops)
         log_buffer.append(f"  Temporal links: {temporal_link_count} links in {time.time() - step_start:.3f}s")
 
@@ -542,6 +545,7 @@ async def _insert_facts_and_links(
         else:
             step_start = time.time()
             embeddings_for_links = [fact.embedding for fact in processed_facts]
+            # 批次内-新增语义关联
             semantic_link_count = await link_creation.create_semantic_links_batch(
                 conn,
                 bank_id,
@@ -559,6 +563,7 @@ async def _insert_facts_and_links(
 
         # Create causal links
         step_start = time.time()
+        # 批次内-新增因果关联
         causal_link_count = await link_creation.create_causal_links_batch(
             conn, bank_id, unit_ids, processed_facts, ops=ops
         )
@@ -597,6 +602,7 @@ async def _extract_and_embed(
     """
     set_stage("retain.extract_and_embed")
     step_start = time.time()
+    # 事实提取
     extracted_facts, chunks, usage = await fact_extraction.extract_facts_from_contents(
         contents, llm_config, agent_name, config, pool, operation_id, schema
     )
@@ -614,9 +620,11 @@ async def _extract_and_embed(
 
     step_start = time.time()
     augmented_texts = embedding_processing.augment_texts_with_dates(extracted_facts, format_date_fn)
+    # embeddings 向量化
     embeddings = await embedding_processing.generate_embeddings_batch(embeddings_model, augmented_texts)
     log_buffer.append(f"  Generate embeddings: {len(embeddings)} embeddings in {time.time() - step_start:.3f}s")
 
+    # 组装结果
     fact_batch = _process_extracted_facts(extracted_facts, embeddings)
 
     return fact_batch.extracted_facts, fact_batch.processed_facts, chunks, usage
@@ -796,7 +804,9 @@ async def retain_batch(
                 group_outbox_callback = (
                     outbox_callback_factory(group_dicts) if outbox_callback_factory is not None else outbox_callback
                 )
-
+                # 一次 retain 调用里同时塞进了多个文档的内容，且没有指定统一的 document_id
+                # 每个文档需要被 独立追踪 ：delta retain、append 模式、 documents 行更新、stale-request 检查、effective_doc_id 落库等
+                # 逻辑全部以 document_id 为键。让每个文档单独走一次完整流水线，比在同一调用栈里维护多文档状态简单得多。
                 group_ids, group_usage, group_processed = await retain_batch(
                     pool=pool,
                     embeddings_model=embeddings_model,
@@ -834,6 +844,9 @@ async def retain_batch(
     # object at this point (see _retain_batch_async_internal). On a non-allow
     # decision we redact in place or drop the item, and fire a
     # memory_defense.triggered webhook when one is configured.
+
+    # 它是写入入口的第二道安全防线：第一道解决编码合法性（防系统崩溃），第二道解决内容合规性（防违规数据入库），共同保障进入系统的记忆数据安全可用。
+    # 通过 getattr 从全局配置中读取 memory_defense 配置节点，未配置时默认返回 None，防御模块自动降级禁用，完全不阻塞主写入链路。
     _policy = parse_policy(getattr(config, "memory_defense", None))
     _blocked_violations: list[BlockedViolation] = []
 
@@ -872,6 +885,7 @@ async def retain_batch(
                         )
                     )
 
+                # 任务写入webhooks、async_operations两个表
                 await _fire_memory_defense_webhook(
                     webhook_manager,
                     conn=_defense_conn,
@@ -881,6 +895,8 @@ async def retain_batch(
                     document_id=_item_doc_id,
                     decision=_decision,
                 )
+
+                # 写入审计日志表 audit_log
                 await _audit_memory_defense(
                     audit_logger,
                     bank_id=bank_id,
@@ -935,6 +951,7 @@ async def retain_batch(
     # Record effective_doc_id on the operation (idempotent set-append). Captures
     # both user-provided and generated ids so the operation shows every document
     # it touched, and lets retries reuse the same generated id.
+    # 仅当存在 operation_id（异步任务场景）时执行；同步写入无异步任务元数据，直接跳过该逻辑。
     if operation_id:
         try:
             async with acquire_with_retry(pool) as conn:
@@ -942,13 +959,19 @@ async def retain_batch(
                     f"""
                     UPDATE {fq_table("async_operations")}
                     SET result_metadata = jsonb_set(
+                        -- 若该行 result_metadata 为 NULL，先初始化为空 JSON 对象，避免后续 jsonb_set 操作报错，兼容任务刚创建、元数据为空的初始状态。
                         COALESCE(result_metadata, '{{}}'::jsonb),
                         '{{document_ids}}',
                         CASE
+                            -- 先读取元数据中的 document_ids 数组，字段不存在则默认为空数组
+                            -- 用 PostgreSQL jsonb 的 @> 包含运算符判断：数组中是否已经存在本次的文档 ID。
+                            -- 已存在：直接返回原数组，不做任何修改，天然去重。
+                            -- 不存在：用 || 运算符将新文档 ID 追加到数组末尾。
                             WHEN COALESCE(result_metadata->'document_ids', '[]'::jsonb) @> $1::jsonb
                                 THEN result_metadata->'document_ids'
                             ELSE COALESCE(result_metadata->'document_ids', '[]'::jsonb) || $1::jsonb
                         END,
+                        -- 最后一个参数 true 为 create_if_missing 开关：字段不存在时自动创建，保证首次写入也能成功，无需提前初始化结构。
                         true
                     ),
                     updated_at = now()
@@ -1037,6 +1060,8 @@ async def retain_batch(
         )
     if doc_row and doc_row["updated_at"]:
         doc_updated = doc_row["updated_at"].timestamp()
+        # 文档最后更新时间晚于本次请求起始时间，说明在本次请求排队、预处理的过程中，已经有另一个并发请求成功完成了该文档的写入更新。
+        # 当前请求基于的是更早的内容版本，属于陈旧请求，继续执行会用旧内容覆盖新写入的数据。
         if doc_updated > start_time:
             log_buffer.append(
                 f"[stale] Skipping retain: document {effective_doc_id} was updated at "
@@ -1049,7 +1074,10 @@ async def retain_batch(
             return [[] for _ in contents], TokenUsage(), 0
 
     # --- Delta retain: check if we can skip unchanged chunks ---
+    # is_first_batch 标识"这是某个超大单条内容被切片后的 第一个子批次 "（见 retain_batch 文档 740-744 行）。
+    # 后续子批次共享同一个 document_id 、按顺序执行，主要负责继续写入 chunk_index 更大的片段。
     if is_first_batch:
+        # _try_delta_retain 的精髓在于 用三层递进的"hash 校验"压窄并发竞争窗口 ，最终正确性由写事务里的 FOR UPDATE 兜底
         delta_result = await _try_delta_retain(
             pool,
             embeddings_model,
@@ -1098,6 +1126,7 @@ async def retain_batch(
     # Python can reclaim the (potentially multi-MB) strings.
     # Note: contents_dicts["content"] is still needed briefly for hash computation
     # inside _streaming_retain_batch, but gets cleared there after use.
+    # 主动释放原始全文本占用的大块内存，压制大批次写入时的内存峰值，避免高并发、大文档场景下的内存溢出，
     for content in contents:
         content.content = ""
 
@@ -1134,6 +1163,7 @@ async def retain_batch(
         db_semaphore=db_semaphore,
         document_body_override=document_body_override,
         chunk_index_offset=chunk_index_offset,
+        # async_operations 更新，外层传进来的函数
         progress_callback=progress_callback,
     )
 
@@ -1223,6 +1253,7 @@ async def _run_final_semantic_ann(
         async with ann_semaphore:
             t0 = time.time()
             async with acquire_with_retry(pool) as conn:
+                # 计算新增记忆单元的语义相似的单元
                 ann_links = await compute_semantic_links_ann(
                     conn,
                     bank_id,
@@ -1234,6 +1265,7 @@ async def _run_final_semantic_ann(
                     log_buffer=log_buffer,
                 )
                 if ann_links:
+                    # memory_links
                     await _bulk_insert_links(conn, ann_links, bank_id=bank_id, ops=pool.ops)
                 chunk_link_counts[chunk_idx] = len(ann_links)
             logger.info(
@@ -1384,6 +1416,9 @@ async def _streaming_retain_batch(
     is_recovery = False
 
     try:
+        # 函数开头，是流式路径的 崩溃恢复识别器 ，运行在 LLM 抽取之前。
+        # 1. 它在识别什么
+        # 判定一个 retain 请求是否是**"同一份内容的重试"**——前一次执行中途崩溃，但已经把部分 chunk 写进了库。
         async with acquire_with_retry(pool) as conn:
             doc_row = await conn.fetchrow(
                 f"SELECT content_hash FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2",
@@ -1423,6 +1458,9 @@ async def _streaming_retain_batch(
     # a no-op for a Postgres store (which keeps the text in its own columns below). ``all_pre_chunks``
     # is the full ordered chunk-text list; ``combined_content`` is the full document text (both are
     # released as the batches stream, so the write happens now while they are still resident).
+    # 这段在流式批处理启动前、 combined_content 与 all_pre_chunks 仍在内存时，把它们 content-addressed 地预写入 store 自带的
+    # 文档存储（Postgres 部署下 no-op）；利用"内容寻址 + 幂等 + 孤儿回收"让它可以安全地早于 facts 提交执行，从而避开流式循环中"用完即弃"内存策略
+    # 与"事务内写正文"的冲突。
     await _store_document_bodies(
         bank_id=bank_id,
         document_id=effective_doc_id,
@@ -1499,6 +1537,7 @@ async def _streaming_retain_batch(
                 )
             finally:
                 reset_call_metadata(meta_token)
+            # 写入任务队列
             await chunk_queue.put((global_idx, content, extracted, processed, chunk_meta, usage))
             # Memory: release the chunk text from the shared list now that it's
             # been extracted and queued. The queued RetainContent holds its own copy.
@@ -1566,6 +1605,7 @@ async def _streaming_retain_batch(
                 logger.debug("retain chunk-progress write failed", exc_info=True)
 
         while True:
+            # 消费队列任务
             item = await chunk_queue.get()
             if item is None:
                 # Process any remaining items
@@ -1689,6 +1729,7 @@ async def _streaming_retain_batch(
                             bank_id,
                         )
                         if is_recovery:
+                            #  新增-INSERT INTO "documents"
                             await fact_storage.upsert_document_metadata(
                                 conn,
                                 bank_id,
@@ -1704,6 +1745,7 @@ async def _streaming_retain_batch(
                             _edge_txn = await _edge_provider.begin_txn(
                                 conn=conn, fq_table=fq_table, bank_id=bank_id, mutating=True
                             )
+                            #  新增-INSERT INTO "documents"
                             await fact_storage.handle_document_tracking(
                                 conn,
                                 bank_id,
@@ -1973,6 +2015,10 @@ async def _streaming_retain_batch(
     # continues a document another sub-batch already started, so it must always do
     # its work — crash-safety for those chunks still comes from the per-chunk hash
     # recovery (existing_chunk_hashes) below.
+    # 这段是流式 retain 的 整文档级崩溃恢复闸门 ：通过查 async_operations.result_metadata.facts_committed_document_ids
+    # 判断本文档的 facts 是否已在前次执行中全部提交，命中则跳过 producer-consumer 直接从 memory_units 读 ID 后跑最终 ANN pass；
+    # chunk_index_offset == 0 守门防止"超大单条被切片"场景下后续子批误命中导致切片丢失，legacy 兼容子句处理旧版无 per-document ID 的
+    # checkpoint，异常时优雅降级为全量重跑。
     facts_already_committed = False
     if operation_id and chunk_index_offset == 0:
         try:
@@ -2057,6 +2103,7 @@ async def _streaming_retain_batch(
                         bank_id,
                     )
                     if is_recovery:
+                        # insert into documents
                         await fact_storage.upsert_document_metadata(
                             conn,
                             bank_id,
@@ -2157,9 +2204,12 @@ async def _streaming_retain_batch(
     # This replaces per-batch within-batch + fire-and-forget ANN with a single
     # efficient pass after all facts are in the database.
     # ---------------------------------------------------------------------------
+    # 核心作用是对本次所有新写入的记忆单元批量计算语义相似度，建立单元间的语义近邻（ANN）关联链接，用于提升后续检索的语义联想与相关记忆召回能力。
     if all_unit_ids and not pipeline_aborted[0]:
         ann_start = time.time()
         try:
+            # create semantic links for ALL committed units at once.
+            # memory_links 新增记忆单元在同一个bankid下的全局相似度阈值内的形成关联，提前计算，便于查询快速响应。
             await _run_final_semantic_ann(
                 pool,
                 bank_id,
@@ -2238,6 +2288,8 @@ def _classify_chunk_diff(existing_by_index: dict[int, Any], new_hashes: dict[int
     return diff
 
 
+# 核心尝试函数，属于写入链路的性能优化路径。核心目标是：对已有文档的更新请求，通过切片哈希对比识别出变化的片段，
+# 仅对新增 / 修改的切片执行 LLM 事实抽取、向量化等重型计算，未变化的切片直接复用，大幅降低算力开销、提升写入速度。
 async def _try_delta_retain(
     pool: Any,
     embeddings_model,

@@ -491,6 +491,8 @@ def _split_oversized_unit(text: str, max_chars: int) -> list[str]:
     return splitter.split_text(text)
 
 
+# 文本切片调度函数，位于文档预处理阶段、向量化执行之前。它承担三大核心职责：自适应识别输入文本格式，优先在语义 / 结构边界处拆分以保留信息完整性，
+# 同时严格保证切片操作的幂等性，从根源避免 chunk_id 冲突等数据一致性问题。
 def chunk_text(text: str, max_chars: int, structured_chunk_size: int | None = None) -> list[str]:
     """
     Split text into chunks, preserving conversation structure when possible.
@@ -954,7 +956,8 @@ Type: "caused_by" (this fact was caused by the target fact)
 Example: "Lost job → couldn't pay rent → moved apartment"
 - Fact 0: Lost job, causal_relations: null
 - Fact 1: Couldn't pay rent, causal_relations: [{target_index: 0, relation_type: "caused_by"}]
-- Fact 2: Moved apartment, causal_relations: [{target_index: 1, relation_type: "caused_by"}]"""
+- Fact 2: Moved apartment, causal_relations: [{target_index: 1, relation_type: "caused_by"}]
+"""
 
 
 def _append_map_fields_prompt(fields: dict[str, "MapField"], lines: list[str], indent: int = 4) -> None:
@@ -1079,7 +1082,7 @@ def _build_extraction_prompt_and_schema(config) -> tuple[str, type]:
 
     retain_mission_section = ""
 
-    # Select base prompt based on extraction mode
+    # Select base prompt based on extraction mode：使用自定义指令
     if extraction_mode == "custom":
         if not config.retain_custom_instructions:
             base_prompt = CONCISE_FACT_EXTRACTION_PROMPT
@@ -1092,15 +1095,18 @@ def _build_extraction_prompt_and_schema(config) -> tuple[str, type]:
                 retain_mission_section=retain_mission_section,
                 custom_instructions=escape_for_prompt(config.retain_custom_instructions),
             )
+    # 详细提取，保留所有细节
     elif extraction_mode == "verbose":
         prompt = VERBOSE_FACT_EXTRACTION_PROMPT.format(
             retain_mission_section=retain_mission_section,
         )
+    # 原文保留，仅提取元数据
     elif extraction_mode == "verbatim":
         prompt = VERBATIM_FACT_EXTRACTION_PROMPT.format(
             retain_mission_section=retain_mission_section,
         )
     else:
+        # 默认：选择性提取，每个 chunk 2-5 个事实，过滤问候语/填充词
         base_prompt = CONCISE_FACT_EXTRACTION_PROMPT
         prompt = base_prompt.format(
             retain_mission_section=retain_mission_section,
@@ -1108,6 +1114,7 @@ def _build_extraction_prompt_and_schema(config) -> tuple[str, type]:
 
     # Add causal relationships section if enabled
     # Verbatim mode never uses causal relations (no fact text to relate causally)
+    # 原文保留，仅提取元数据
     if extraction_mode == "verbatim":
         base_fact_class = VerbatimExtractedFact
         base_response_class = VerbatimFactExtractionResponse
@@ -1327,6 +1334,7 @@ async def _extract_facts_from_chunk(
     logger = logging.getLogger(__name__)
 
     # Build prompt and schema using helper function
+    # 系统提示词
     prompt, response_schema = _build_extraction_prompt_and_schema(config)
 
     # Check config for extraction mode and causal link extraction
@@ -1334,6 +1342,7 @@ async def _extract_facts_from_chunk(
     extract_causal_links = config.retain_extract_causal_links
 
     # Build user message — the bank mission rides here (not in the cached prefix).
+    # 用户提示词组装
     user_message = _build_user_message(
         chunk,
         chunk_index,
@@ -1352,6 +1361,8 @@ async def _extract_facts_from_chunk(
     # cost. ``get_or_create_cached_prefix`` returns None when caching is
     # disabled, unsupported, or the prefix is too small; the LLM call
     # transparently falls back to the uncached path in that case.
+    # 核心作用是：自动探测当前模型服务商是否支持系统提示缓存能力，若支持则将固定不变的系统指令、输出结构 schema 注册为可复用缓存前缀，
+    # 后续同配置调用直接命中缓存，大幅降低重复 token 消耗、减少调用成本、缩短首 token 响应延迟。
     cached_prefix_name: str | None = None
     provider_impl = getattr(llm_config, "_provider_impl", None)
     if provider_impl is not None and provider_impl.supports_prompt_caching():
@@ -1751,6 +1762,9 @@ async def _extract_facts_with_auto_split(
         )
 
         # Process both halves recursively (in parallel)
+        # 将当前文本拆分为 first_half 和 second_half 两个子块，分别递归调用同一个抽取函数，形成二分递归：
+        # 子块若仍超长，会继续向下拆分，直到子块长度满足 LLM 上下文要求，执行实际模型调用；
+        # 递归深度随文本长度对数增长，收敛性极强，不会出现无限递归。
         sub_tasks = [
             _extract_facts_with_auto_split(
                 chunk=first_half,

@@ -225,6 +225,7 @@ class PostgreSQLDialect(SQLDialect):
         else:  # native tsvector
             # bm25_language is validated as a PG identifier in HindsightConfig.validate(),
             # so embedding it as a SQL literal here is safe.
+            # ⚠️ PostgreSQL 原生 ts_rank / ts_rank_cd 不是 BM25，是旧的 tsearch 加权算法，很多人踩坑。
             bm25_score_expr = f"ts_rank_cd(search_vector, to_tsquery('{bm25_language}', {text_param}))"
             bm25_order_by = f"{bm25_score_expr} DESC"
             bm25_where_filter = f"AND search_vector @@ to_tsquery('{bm25_language}', {text_param})"

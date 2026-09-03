@@ -26,6 +26,7 @@ def cap_per_source(results: list[RetrievalResult], cap: int) -> list[RetrievalRe
     return results[:cap]
 
 
+# 是绝大多数向量数据库、检索系统的默认融合方案。
 def reciprocal_rank_fusion(result_lists: list[list[RetrievalResult]], k: int = 60) -> list[MergedCandidate]:
     """
     Merge multiple ranked result lists using Reciprocal Rank Fusion.
@@ -109,6 +110,7 @@ def reciprocal_rank_fusion(result_lists: list[list[RetrievalResult]], k: int = 6
     return merged_results
 
 
+# 专门服务于记忆合并、观察整合等去重场景，不用于通用问答召回。
 def interleave_fusion(result_lists: list[list[RetrievalResult]]) -> list[MergedCandidate]:
     """Round-robin (interleaved) fusion — an alternative to RRF for dedup-style recall.
 
@@ -141,9 +143,11 @@ def interleave_fusion(result_lists: list[list[RetrievalResult]]) -> list[MergedC
                     f"Expected RetrievalResult but got {type(retrieval).__name__} in {source_name} results at rank {rank}"
                 )
             doc_id = retrieval.id
-            all_retrievals.setdefault(doc_id, retrieval)
+            all_retrievals.setdefault(
+                doc_id, retrieval
+            )  # key存在：直接返回字典里已有的value，default完全丢弃，不会执行赋值
             source_ranks.setdefault(doc_id, {})[f"{source_name}_rank"] = rank
-            arm = arm_scores.setdefault(doc_id, ArmScores())
+            arm = arm_scores.setdefault(doc_id, ArmScores())  # return ArmScores 后续关联设值
             if source_name == "semantic" and retrieval.similarity is not None:
                 arm.semantic = retrieval.similarity
             elif source_name == "bm25" and retrieval.bm25_score is not None:

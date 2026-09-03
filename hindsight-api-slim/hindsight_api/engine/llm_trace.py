@@ -595,6 +595,7 @@ class LLMTraceRecorder:
         if not patch:
             return
         try:
+            # event --_attach_memory_ids 事件执行llm requests调用记录
             asyncio.create_task(self._attach_memory_ids(trace_ctx.bank_id, trace_ctx.trace_id, patch))
         except RuntimeError:
             logger.debug("Cannot schedule llm trace memory_id attach: no running event loop")

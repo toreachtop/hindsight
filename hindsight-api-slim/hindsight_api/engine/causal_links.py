@@ -8,7 +8,10 @@ semantics without allowing new retain output to create those types.
 from dataclasses import dataclass
 from typing import Any
 
+# 当前官方唯一认可的规范化因果链接类型，统一表示「存在因果关联」。
 CANONICAL_CAUSAL_LINK_TYPE = "caused_by"
+
+# 早期版本的细分因果类型，分别对应「导致」「促成」「阻止」三种不同方向 / 强度的因果关系。
 LEGACY_CAUSAL_LINK_TYPE_NAMES = ("causes", "enables", "prevents")
 
 CANONICAL_CAUSAL_LINK_TYPES = frozenset({CANONICAL_CAUSAL_LINK_TYPE})

@@ -3690,8 +3690,12 @@ class MemoryEngine(MemoryEngineInterface):
         # disabled there is no stored text to read, so the append would silently
         # drop all prior content — reject it explicitly instead. Resolve the
         # per-bank setting only when an append is actually requested.
+        # 遍历当前批次所有写入条目，只要存在一条内容使用 append 更新模式，就进入后续校验流程。
         if any(item.get("update_mode") == "append" for item in contents):
+            # 设计原因：store_document_text 支持全局默认 + 单 bank 覆盖的两级配置，常规写入不需要查询 bank 级定制配置；
+            # 仅在追加场景下才按需拉取，避免无意义的配置查询开销，优化热路径性能。
             bank_cfg = await self._config_resolver.get_bank_config(bank_id, request_context)
+            # 若目标 bank 关闭了文档原始文本存储（store_document_text=false），则直接抛出异常，拒绝本次 append 请求。
             if not bank_cfg.get("store_document_text", DEFAULT_STORE_DOCUMENT_TEXT):
                 raise ValueError(
                     "update_mode='append' is not supported when document text storage "
@@ -3711,6 +3715,7 @@ class MemoryEngine(MemoryEngineInterface):
 
         # Get batch size threshold from config
         config = get_config()
+        # DEFAULT_RETAIN_BATCH_TOKENS = 10_000
         tokens_per_batch = config.retain_batch_tokens
 
         if total_tokens > tokens_per_batch:
@@ -3753,6 +3758,12 @@ class MemoryEngine(MemoryEngineInterface):
             # with, so the offsets match the chunk_index values it assigns.
             from .retain import fact_extraction, fact_storage
 
+            # 前置切片配置统一解析模块。核心作用是提供一个全局统一的切片参数计算入口，
+            # 确保「前置预估逻辑」和「实际执行编排器」使用完全一致的切片配置，从根源避免 chunk_index 索引错位引发的连锁数据问题。
+
+            # 封装为专用的 _RetainChunkingConfig 结构体返回，包含两类切片配置：
+            # chunk_size：普通文本的切片大小，默认兜底值为 3000；
+            # structured_chunk_size：结构化文档（表格、JSON、Markdown 等）的专属切片大小，未配置时为 None，回退使用通用大小。
             chunking_config = await self._resolve_retain_chunking_config(bank_id, request_context, strategy)
             chunk_offsets: dict[str, int] = {}
 
@@ -3776,6 +3787,8 @@ class MemoryEngine(MemoryEngineInterface):
                     existing_text = await fact_storage.get_document_content(conn, bank_id, append_doc_id)
                 if existing_text:
                     append_prepend_chunks[append_doc_id] = len(
+                        # 文本切片调度函数，位于文档预处理阶段、向量化执行之前。它承担三大核心职责：自适应识别输入文本格式，
+                        # 优先在语义 / 结构边界处拆分以保留信息完整性，同时严格保证切片操作的幂等性，从根源避免 chunk_id 冲突等数据一致性问题。
                         fact_extraction.chunk_text(
                             existing_text,
                             chunking_config.chunk_size,
@@ -3783,8 +3796,10 @@ class MemoryEngine(MemoryEngineInterface):
                         )
                     )
 
+            # 按序号遍历所有子批次，同时绑定原始索引，保证结果与输入顺序一一对应。
             for i, (sub_batch, sub_origins) in enumerate(zip(sub_batches, origin_indices), 1):
                 # Checkpoint: abort if the operation was deleted (bank was deleted) between sub-batches.
+                # async_operations 表，status字段状态。取消的话终止任务执行。
                 if operation_id and not await self._check_op_alive(operation_id):
                     logger.info(
                         f"[BATCH_RETAIN] bank={bank_id} operation {operation_id} cancelled (bank deleted), stopping after {i - 1}/{len(sub_batches)} sub-batches"
@@ -3807,6 +3822,8 @@ class MemoryEngine(MemoryEngineInterface):
                 # sub-batches of the same document. Only the oversized-single-item
                 # split shares a document_id across sub-batches; packed multi-item
                 # sub-batches carry distinct document_ids (offset stays 0).
+                # 普通打包子批次：多个不同文档的条目打包在一个子批次中，每个 document_id 唯一且仅出现在一个子批次里，无需偏移，默认值为 0。
+                # 超大单文档拆分子批次：单个文档内容远超单批次 Token 预算，被拆分到多个子批次串行处理，同一个 document_id 跨多个子批次存在。
                 sub_doc_id = document_id or (sub_batch[0].get("document_id") if len(sub_batch) == 1 else None)
                 sub_offset = chunk_offsets.get(sub_doc_id, 0) if sub_doc_id else 0
 
@@ -3900,7 +3917,7 @@ class MemoryEngine(MemoryEngineInterface):
             # Progress for this path is emitted by the streaming pipeline as
             # "storing N/total chunks" via progress_callback (see _retain_batch_async_internal).
 
-        await self._write_retain_outcome_metadata(operation_id, result)
+        await self._write_retain_outcome_metadata(operation_id, result)  # updatea sync_operations
 
         # Call post-operation hook if validator is configured
         if self._operation_validator:
@@ -3923,11 +3940,15 @@ class MemoryEngine(MemoryEngineInterface):
                 processed_content_tokens=total_processed_content_tokens,
             )
             try:
+                # 有test，实际啥也没干，默认pass
                 await self._operation_validator.on_retain_complete(result_ctx)
             except Exception as e:
                 logger.warning(f"Post-retain hook error (non-fatal): {e}")
 
         # Same async side effects every fact insert triggers (retain or import).
+        # 创建两个异步任务：
+        # graph_maintenance-
+        # consolidation-执行长期记忆凝练优化：冗余记忆去重合并、矛盾事实校验标记、高阶知识抽象、时序关系校准，是 Hindsight 分层记忆体系的核心后台优化能力。
         await self._submit_post_insert_maintenance(bank_id, request_context)
 
         if return_usage:
@@ -4084,6 +4105,7 @@ class MemoryEngine(MemoryEngineInterface):
             created_ids = [uid for group in result[0] for uid in group]
             # Fire-and-forget: the mapping is patched on a background task so it
             # never adds latency to the retain response.
+            # event --_attach_memory_ids 事件执行llm requests调用记录
             self._llm_recorder.attach_memory_ids(trace_context_of(retain_llm), created=created_ids)
             return result
 
@@ -4449,6 +4471,8 @@ class MemoryEngine(MemoryEngineInterface):
                 tags_match=tags_match,
                 tag_groups=tag_groups,
             )
+            # 初始化逻辑的一部分，属于框架级可选扩展点机制，具体是「召回操作验证器」扩展的注入与启用逻辑，核心目的是在不侵入引擎核心代码的前提下，
+            # 支持业务侧自定义前置校验、权限管控、合规审计等能力。
             result = await self._validate_operation(self._operation_validator.validate_recall(ctx))
             if result:
                 if result.tags is not None:
@@ -4461,6 +4485,9 @@ class MemoryEngine(MemoryEngineInterface):
         # Map budget enum to thinking_budget number using bank-resolved config.
         # Function "fixed" preserves legacy {LOW: 100, MID: 300, HIGH: 1000}; function "adaptive"
         # derives from max_tokens and clamps to [recall_budget_min, recall_budget_max].
+        # 核心作用是将 API 层传入的语义化预算枚举（LOW/MID/HIGH），结合目标记忆库的专属配置，转换为引擎内部实际使用的整数型召回数量上限 thinking_budget，
+        # 是「对外易用性 + 对内精细化管控」的典型设计。
+        # 请求参数如："budget": "mid",
         budget_config_dict = await self._config_resolver.get_bank_config(bank_id, request_context)
         thinking_budget = _resolve_thinking_budget(budget_config_dict, budget, max_tokens)
 
@@ -4774,7 +4801,7 @@ class MemoryEngine(MemoryEngineInterface):
                 ) as op:
                     budgeted_pool = op.wrap_pool(backend)
                     parallel_start = time.time()
-                    multi_result = await retrieve_all_fact_types_parallel(
+                    multi_result = await retrieve_all_fact_types_parallel(  # 四路并行检索
                         budgeted_pool,
                         query,
                         query_embedding_str,
@@ -5022,6 +5049,8 @@ class MemoryEngine(MemoryEngineInterface):
                 result_lists = [semantic_results, bm25_results, graph_results]
                 if temporal_results:
                     result_lists.append(temporal_results)
+
+                # 系统提供了两种融合策略：工业界通用的倒数秩融合（RRF） 和专门为记忆去重场景定制的交错轮询融合（Interleave），由 reranking 参数动态切换。
                 fuse = interleave_fusion if reranking == "interleave" else reciprocal_rank_fusion
                 merged_candidates = fuse(result_lists)
 
@@ -5165,6 +5194,9 @@ class MemoryEngine(MemoryEngineInterface):
             # threshold is a no-op. There is deliberately no default — the
             # cross-encoder's absolute scores are not calibrated for a fixed cutoff
             # (a clearly-relevant match can score ~0.001 while its *ranking* is right).
+            # 这段代码定义了 Hindsight 召回系统中的分级最低分数阈值配置模型 MinScores，
+            # 用于在召回链路的不同阶段设置分数下限，分层过滤低质量候选结果。
+            # 它采用「前置 SQL 剪枝 + 后置精筛」的两级设计，是控制召回精度、平衡召回率与计算成本的核心配置入口。
             min_reranker = min_scores.reranker if min_scores else None
             min_final = min_scores.final if min_scores else None
             if (min_reranker is not None or min_final is not None) and scored_results:
@@ -5213,6 +5245,9 @@ class MemoryEngine(MemoryEngineInterface):
             # twice. Runs BEFORE the Step 5 truncation so the freed slots backfill with
             # the next-best results, keeping the result count at the budget. No-op unless
             # 'observation' and at least one raw type were both requested.
+            # 多路召回融合后的 **「观察优先去重」后置处理步骤 **
+            # 当一次召回请求同时拉取「原始事实 + 观察类记忆」时，同一份信息会以「原始碎片 + 归纳结论」两种形式重复出现在结果里，
+            # 既浪费 LLM 上下文 Token，也会干扰后续生成质量。这个步骤就是为了解决这个冗余问题。
             raw_types_requested = {"world", "experience"} & set(fact_type)
             if prefer_observations and "observation" in fact_type and raw_types_requested:
                 # "The observation list" = observations within the window we would return.
@@ -5301,14 +5336,18 @@ class MemoryEngine(MemoryEngineInterface):
                     # A store that keeps memories outside SQL: fetch each observation, then its
                     # source memories, for their chunk_ids — the join the SQL branch does, walked
                     # in observation-rank order so per-observation grouping is preserved.
+                    # FROM {fq_table("memory_units")} WHERE bank_id = $1 AND id = ANY($2::uuid[])
                     obs_units = await _obs_store.get_memories(
                         conn=None,
                         fq_table=fq_table,
                         bank_id=bank_id,
                         unit_ids=[str(o) for o in observation_ids_ordered],
                     )
+                    # observation 类型的记忆是没有关联原文的，是从记忆原文推理出来的，所以数据存储上就没有记忆原文ID，但是存了记忆哪些id推理得来的，再根据
+                    # source_memory_ids 去找记忆原文的chunk_id，去找原始消息记录
                     by_obs = {u.unit_id: u for u in obs_units}
                     src_ids = [sid for u in obs_units for sid in u.source_memory_ids]
+                    # FROM {fq_table("memory_units")} WHERE bank_id = $1 AND id = ANY($2::uuid[])
                     srcs = await _obs_store.get_memories(
                         conn=None, fq_table=fq_table, bank_id=bank_id, unit_ids=list(dict.fromkeys(src_ids))
                     )
@@ -5324,6 +5363,7 @@ class MemoryEngine(MemoryEngineInterface):
                                 seen_chunk_ids.add(_cid)
                 elif observation_ids_ordered:
                     async with acquire_with_retry(backend) as obs_conn:
+                        # PG uses native array ops on source_memory_ids。pg支持数组存储，所以没有启用关联表。
                         if self._backend.ops.uses_observation_sources_table:
                             obs_source_rows = await obs_conn.fetch(
                                 f"""
@@ -5536,6 +5576,9 @@ class MemoryEngine(MemoryEngineInterface):
             source_fact_ids_by_obs: dict[str, list[str]] = {}  # obs_id -> [source_id, ...]
             source_facts_dict: dict[str, MemoryFact] | None = None
             if include_source_facts:
+                # Hindsight 召回链路中观察类记忆（observation）的来源事实溯源模块，属于召回结果的后置组装环节。
+                # 它的核心作用是：为召回得到的 observation 高阶记忆，批量加载其背后的原始来源记忆（source facts），
+                # 并按 Token 预算做精准截断，最终输出标准化的证据链数据，支撑 LLM 回答的可追溯性。
                 observation_ids = [uuid.UUID(sr.id) for sr in top_scored if sr.retrieval.fact_type == "observation"]
                 if observation_ids:
                     from .memories import get_memories

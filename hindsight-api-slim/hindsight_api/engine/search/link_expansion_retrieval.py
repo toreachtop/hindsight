@@ -308,7 +308,7 @@ class LinkExpansionRetriever(GraphRetriever):
 
         entity_cte = ops.build_entity_expansion_cte(mu, ue, per_entity_limit)
         semantic_causal_cte = ops.build_semantic_causal_cte(ml, mu)
-
+        # entity_expanded semantic_expanded causal_expanded
         full_query = f"""
             WITH {entity_cte},
             {semantic_causal_cte}

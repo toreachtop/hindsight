@@ -424,6 +424,10 @@ async def create_temporal_links_batch_per_fact(
         raise
 
 
+# 这是 Hindsight 语义关联构建体系的Phase 1 存量近邻检索函数，是整个语义链接流水线的计算核心。它负责在写入事务之外的独立连接上，
+# 批量为新生成的记忆单元从存量记忆库中召回语义最相似的近邻单元，输出标准化的关联元组供后续事务内落库。
+# 核心设计原则：将昂贵的向量检索（ANN）完全从写事务中剥离，避免长时间持有数据库锁、拖慢写入吞吐量；同时针对 PostgreSQL 向量检索做了多层深度性能优化，
+# 适配生产级连接池与大规模向量场景。
 async def compute_semantic_links_ann(
     conn,
     bank_id: str,
@@ -502,12 +506,15 @@ async def compute_semantic_links_ann(
             await conn.execute(f"SET LOCAL {guc} = {value}")
 
         t_setup = time_mod.time()
+        # 创建专用临时表存储检索种子：占位单元 ID、向量字符串、事实类型；ON COMMIT DROP：事务提交后自动删除临时表，无需手动清理，避免资源残留。
         await conn.execute("CREATE TEMP TABLE _ann_seeds (unit_id text, emb_text text, fact_type text) ON COMMIT DROP")
 
         records = [
             (uid, emb if isinstance(emb, str) else str(emb), ft)
             for uid, emb, ft in zip(unit_ids, embeddings, fact_types)
         ]
+
+        # 使用 COPY 协议批量导入数据，远快于逐行 INSERT，大幅提升大数据量下的导入效率；
         await conn.copy_records_to_table("_ann_seeds", records=records, columns=["unit_id", "emb_text", "fact_type"])
         logger.debug(f"[ANN] Temp table setup: {time_mod.time() - t_setup:.3f}s ({len(records)} seeds)")
 
@@ -525,6 +532,7 @@ async def compute_semantic_links_ann(
             # ~1k units took 1.5-3.7s, ~25-48x slower than casting once). The
             # stable `vector` column also lets the planner consider an HNSW
             # index scan, which a cast expression inhibits.
+            #
             ft_rows = await conn.fetch(
                 f"""
                 WITH seeds AS MATERIALIZED (
@@ -536,6 +544,7 @@ async def compute_semantic_links_ann(
                        n.id::text      AS to_id,
                        n.similarity
                 FROM seeds s
+                -- 使用 CROSS JOIN LATERAL 实现批量近邻查询，对每个种子单元独立执行一次 Top-K 检索，比循环单条查询效率高得多；
                 CROSS JOIN LATERAL (
                     SELECT mu.id,
                            1 - (mu.embedding <=> s.emb) AS similarity
@@ -569,6 +578,9 @@ async def compute_semantic_links_ann(
     return links
 
 
+# 语义关联体系的批次内近邻补充计算函数，与前文的存量 ANN 检索函数 compute_semantic_links_ann 形成互补：前者负责检索历史存量单元的近邻，
+# 本函数负责计算同批次新生成单元之间的语义相似度，补齐新单元内部的关联关系。
+# 全程基于内存中的向量数据，使用 NumPy 向量化计算，无任何数据库交互，零 IO 开销、执行速度极快，属于投入产出比极高的检索质量增强优化。
 def compute_semantic_links_within_batch(
     unit_ids: list[str],
     embeddings: list[list[float]],

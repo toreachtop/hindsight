@@ -133,6 +133,11 @@ def _request_params(
     return params or None
 
 
+# 移除范围：\x00-\x08、\x0b-\x0c、\x0e-\x1f、\x7f，即除 3 个合法空白控制符之外的全部 ASCII 控制字符。
+# 0x09 水平制表符（\t）
+# 0x0A 换行符（\n）
+# 0x0D 回车符（\r）
+# 三类是文本中常见的格式字符，在 JSON、PostgreSQL、LLM 接口中均合法，因此予以保留，不破坏原文排版。
 def sanitize_text(text: str | None) -> str | None:
     """
     Sanitize text by removing characters that break downstream systems.

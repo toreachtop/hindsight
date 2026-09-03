@@ -137,6 +137,8 @@ async def enqueue_relink_victims(
     )
 
 
+# 它的核心定位是对实体表、共现关系表做 bank 级别的全量垃圾回收与健康度校准，清理记忆删除、文档重写后残留的孤儿数据，压缩图谱存储体积，
+# 保证实体联想检索的性能与准确性。
 async def run_graph_maintenance_job(
     memory_engine: "MemoryEngine",
     bank_id: str,

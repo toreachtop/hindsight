@@ -7488,6 +7488,21 @@ def _register_routes(app: FastAPI):
         """Retain memories with optional async processing."""
         metrics = get_metrics_collector()
 
+        # {
+        #   "async": false,
+        #   "items": [
+        #     {
+        #       "content": "Alice works at Google",
+        #       "context": "work",
+        #       "document_id": "conversation_123"
+        #     },
+        #     {
+        #       "content": "Bob went hiking yesterday",
+        #       "document_id": "conversation_123",
+        #       "timestamp": "2024-01-15T10:00:00Z"
+        #     }
+        #   ]
+        # }
         try:
             # Group items by strategy
             strategy_groups: dict[str | None, list[dict]] = {}
@@ -7526,6 +7541,7 @@ def _register_routes(app: FastAPI):
                 all_operation_ids = []
                 total_items_count = 0
                 for group_strategy, contents in strategy_groups.items():
+                    # 异步写入处理管道
                     result = await app.state.memory.submit_async_retain(
                         bank_id,
                         contents,
@@ -7567,6 +7583,7 @@ def _register_routes(app: FastAPI):
                 total_usage = TokenUsage(input_tokens=0, output_tokens=0, total_tokens=0)
                 with metrics.record_operation("retain", bank_id=bank_id, source="api"):
                     for group_strategy, contents in strategy_groups.items():
+                        # 同步写入管道
                         result, usage = await app.state.memory.retain_batch_async(
                             bank_id=bank_id,
                             contents=contents,

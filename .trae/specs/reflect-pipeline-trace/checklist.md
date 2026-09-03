@@ -1,0 +1,8 @@
+- [x] 文档 `docs/reflect-pipeline-trace.md` 已生成且内容完整
+- [x] 文档包含入口层（MemoryEngine.reflect_async → run_reflect_agent）的调用链
+- [x] 文档包含 Disposition Profile 和 Directives 的加载流程
+- [x] 文档包含 Agentic Loop 的迭代逻辑（强制顺序 → auto → 终止）
+- [x] 文档包含四工具（search_mental_models / search_observations / recall / expand）的类和方法映射
+- [x] 文档包含最终合成（build_final_prompt → LLM 调用 → 结构化输出）的流程
+- [x] 文档标注了观点形成与强化、背景合并在代码中的实际实现位置
+- [x] 文档中每个关键方法标注了源文件路径和大致行号

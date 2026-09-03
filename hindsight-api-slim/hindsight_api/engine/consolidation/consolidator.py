@@ -950,6 +950,7 @@ async def _count_unconsolidated_rows(
     )
 
 
+# 接口触发，定时任务-待确认？
 async def run_consolidation_job(
     memory_engine: "MemoryEngine",
     bank_id: str,

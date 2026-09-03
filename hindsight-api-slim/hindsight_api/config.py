@@ -368,6 +368,8 @@ ENV_EMBEDDINGS_ONNX_QUERY_PREFIX = "HINDSIGHT_API_EMBEDDINGS_ONNX_QUERY_PREFIX"
 ENV_EMBEDDINGS_ONNX_PASSAGE_PREFIX = "HINDSIGHT_API_EMBEDDINGS_ONNX_PASSAGE_PREFIX"
 ENV_EMBEDDINGS_ONNX_OUTPUT_NAME = "HINDSIGHT_API_EMBEDDINGS_ONNX_OUTPUT_NAME"
 ENV_EMBEDDINGS_TEI_URL = "HINDSIGHT_API_EMBEDDINGS_TEI_URL"
+ENV_EMBEDDINGS_OLLAMA_MODEL = "HINDSIGHT_API_EMBEDDINGS_OLLAMA_MODEL"
+ENV_EMBEDDINGS_OLLAMA_BASE_URL = "HINDSIGHT_API_EMBEDDINGS_OLLAMA_BASE_URL"
 ENV_EMBEDDINGS_OPENAI_API_KEY = "HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY"
 ENV_EMBEDDINGS_OPENAI_MODEL = "HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL"
 ENV_EMBEDDINGS_OPENAI_BASE_URL = "HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL"
@@ -890,6 +892,8 @@ DEFAULT_EMBEDDINGS_ONNX_QUERY_PREFIX = "query: "
 DEFAULT_EMBEDDINGS_ONNX_PASSAGE_PREFIX = "passage: "
 DEFAULT_EMBEDDINGS_OPENAI_MODEL = "text-embedding-3-small"
 DEFAULT_EMBEDDINGS_OPENAI_BATCH_SIZE = 100
+DEFAULT_EMBEDDINGS_OLLAMA_MODEL = "nomic-embed-text"
+DEFAULT_EMBEDDINGS_OLLAMA_BASE_URL = "http://localhost:11434"
 DEFAULT_EMBEDDINGS_GEMINI_MODEL = "gemini-embedding-001"
 DEFAULT_EMBEDDINGS_GEMINI_OUTPUT_DIMENSIONALITY = 768
 DEFAULT_EMBEDDINGS_GEMINI_FORCE_IPV4 = False
@@ -1912,6 +1916,8 @@ class HindsightConfig:
     embeddings_onnx_passage_prefix: str
     embeddings_onnx_output_name: str | None
     embeddings_tei_url: str | None
+    embeddings_ollama_model: str
+    embeddings_ollama_base_url: str
     embeddings_openai_base_url: str | None
     embeddings_cohere_api_key: str | None
     embeddings_cohere_model: str
@@ -2797,6 +2803,8 @@ class HindsightConfig:
             ),
             embeddings_onnx_output_name=os.getenv(ENV_EMBEDDINGS_ONNX_OUTPUT_NAME) or None,
             embeddings_tei_url=os.getenv(ENV_EMBEDDINGS_TEI_URL),
+            embeddings_ollama_model=os.getenv(ENV_EMBEDDINGS_OLLAMA_MODEL, DEFAULT_EMBEDDINGS_OLLAMA_MODEL),
+            embeddings_ollama_base_url=os.getenv(ENV_EMBEDDINGS_OLLAMA_BASE_URL, DEFAULT_EMBEDDINGS_OLLAMA_BASE_URL),
             embeddings_openai_base_url=os.getenv(ENV_EMBEDDINGS_OPENAI_BASE_URL) or None,
             embeddings_openai_batch_size=_parse_positive_int(
                 ENV_EMBEDDINGS_OPENAI_BATCH_SIZE,

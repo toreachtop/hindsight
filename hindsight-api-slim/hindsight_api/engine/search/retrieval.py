@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# 大写转小写 用空格拆分为列表
 def tokenize_query(query_text: str) -> list[str]:
     """Normalize query text and split into BM25 tokens.
 
@@ -220,8 +221,9 @@ async def retrieve_semantic_bm25_combined_sql(
     # the SQL arms before fusion.
     sem_min = min_semantic if min_semantic is not None else config.semantic_min_similarity
     bm25_min = min_keyword if min_keyword is not None else config.bm25_min_score
-
-    # Over-fetch for HNSW approximation; semantic results trimmed to limit in Python.
+    # Over‑fetch：多拿候选，再二次过滤/重排，最后裁剪到目标limit数量
+    # Over-fetch for HNSW approximation; semantic results trimmed to limit in Python.HNSW 向量检索是近似最近邻搜索，
+    # 召回结果存在漏召回、排序偏差问题。
     hnsw_fetch = max(limit * 5, 100)
 
     cols = (
@@ -895,8 +897,7 @@ async def retrieve_all_fact_types_parallel(
 
     async with acquire_with_retry(pool) as conn:
         conn_wait = time.time() - semantic_bm25_start
-
-        # Semantic + BM25 combined
+        # Semantic-语义 + BM25-关键词 combined
         semantic_bm25_results = await retrieve_semantic_bm25_combined(
             conn,
             query_embedding_str,
@@ -914,7 +915,7 @@ async def retrieve_all_fact_types_parallel(
             graph_seed_min_similarity=config.graph_seed_min_similarity,
         )
         semantic_bm25_time = time.time() - semantic_bm25_start
-
+        # 四条边：链接类型temporal 时序检索 Hindsight 多路召回架构中「时序联合召回通路」的触发入口
         # Temporal combined (if constraint detected) - same connection!
         if temporal_constraint:
             tc_start, tc_end = temporal_constraint
@@ -939,6 +940,7 @@ async def retrieve_all_fact_types_parallel(
     timings["semantic_bm25_combined"] = semantic_bm25_time
     timings["temporal_combined"] = temporal_time
 
+    # 从语义匹配的种子记忆出发，沿着「实体关联、语义相似、因果逻辑」三类记忆边向外扩散，召回 “语义不直接相似但逻辑高度关联” 的记忆，模拟人类的联想式回忆。
     # Step 3: Run graph retrieval for each fact type in parallel
     async def run_graph_for_fact_type(
         ft: str,

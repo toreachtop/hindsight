@@ -1097,6 +1097,126 @@ class ZeroEntropyEmbeddings(Embeddings):
         return list(struct.unpack(f"<{len(raw) // 4}f", raw))
 
 
+class OllamaEmbeddings(Embeddings):
+    """
+    Ollama embeddings implementation using the Ollama /api/embeddings endpoint.
+
+    Ollama provides a local embedding server that supports various embedding models
+    (e.g., nomic-embed-text, mxbai-embed-large, bge-m3, all-minilm, embeddinggemma).
+
+    The /api/embed endpoint accepts an ``input`` array of strings and returns an
+    ``embeddings`` array of vectors.
+
+    The embedding dimension is auto-detected from the model at initialization.
+    """
+
+    def __init__(
+        self,
+        base_url: str = "http://localhost:11434",
+        model: str = "nomic-embed-text",
+        timeout: float = 60.0,
+        batch_size: int = 100,
+    ):
+        """
+        Initialize Ollama embeddings client.
+
+        Args:
+            base_url: Base URL of the Ollama server (default: http://localhost:11434)
+            model: Ollama embedding model name (default: nomic-embed-text)
+            timeout: Request timeout in seconds (default: 60.0)
+            batch_size: Maximum batch size for embedding requests (default: 100)
+        """
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.timeout = timeout
+        self.batch_size = batch_size
+        self._client: httpx.Client | None = None
+        self._dimension: int | None = None
+
+    @property
+    def provider_name(self) -> str:
+        return "ollama"
+
+    @property
+    def dimension(self) -> int:
+        if self._dimension is None:
+            raise RuntimeError("Embeddings not initialized. Call initialize() first.")
+        return self._dimension
+
+    async def initialize(self) -> None:
+        """Initialize the HTTP client and detect embedding dimension."""
+        if self._client is not None:
+            return
+
+        logger.info(f"Embeddings: initializing Ollama provider at {self.base_url} with model {self.model}")
+
+        self._client = httpx.Client(
+            timeout=self.timeout,
+            headers={"Content-Type": "application/json"},
+        )
+
+        # Do a test embedding to detect dimension
+        try:
+            response = self._client.post(
+                f"{self.base_url}/api/embed",
+                json={"model": self.model, "input": ["test"]},
+            )
+            response.raise_for_status()
+            result = response.json()
+            embeddings = result.get("embeddings", [])
+            if not embeddings or len(embeddings) == 0 or len(embeddings[0]) == 0:
+                raise RuntimeError(f"Ollama returned empty embeddings for model {self.model}")
+            self._dimension = len(embeddings[0])
+            logger.info(f"Embeddings: Ollama provider initialized (model: {self.model}, dim: {self._dimension})")
+        except httpx.HTTPError as e:
+            raise RuntimeError(
+                f"Failed to connect to Ollama server at {self.base_url}: {e}. "
+                f"Make sure Ollama is running and the model '{self.model}' is pulled "
+                f"(ollama pull {self.model})"
+            )
+
+    def encode(self, texts: list[str]) -> list[list[float]]:
+        """
+        Generate embeddings using the Ollama /api/embed endpoint.
+
+        Args:
+            texts: List of text strings to encode
+
+        Returns:
+            List of embedding vectors (one per input text)
+        """
+        if self._client is None:
+            raise RuntimeError("Embeddings not initialized. Call initialize() first.")
+
+        if not texts:
+            return []
+
+        all_embeddings: list[list[float]] = []
+
+        # Process in batches
+        for i in range(0, len(texts), self.batch_size):
+            batch = texts[i : i + self.batch_size]
+
+            try:
+                response = self._client.post(
+                    f"{self.base_url}/api/embed",
+                    json={"model": self.model, "input": batch},
+                )
+                response.raise_for_status()
+                result = response.json()
+                batch_embeddings = result.get("embeddings", [])
+                if len(batch_embeddings) != len(batch):
+                    raise RuntimeError(
+                        f"Ollama returned {len(batch_embeddings)} embeddings for "
+                        f"{len(batch)} input texts; expected exact 1:1 alignment"
+                    )
+                all_embeddings.extend(batch_embeddings)
+            except httpx.HTTPError as e:
+                raise RuntimeError(f"Ollama embedding request failed: {e}")
+
+        return all_embeddings
+
+
 class LiteLLMEmbeddings(Embeddings):
     """
     LiteLLM embeddings implementation using LiteLLM proxy's /embeddings endpoint.
@@ -1747,6 +1867,11 @@ def create_embeddings_from_env() -> Embeddings:
             base_url=config.embeddings_cohere_base_url,
             output_dimensions=config.embeddings_cohere_output_dimensions,
         )
+    elif provider == "ollama":
+        return OllamaEmbeddings(
+            base_url=config.embeddings_ollama_base_url,
+            model=config.embeddings_ollama_model,
+        )
     elif provider == "litellm":
         return LiteLLMEmbeddings(
             api_base=config.embeddings_litellm_api_base,
@@ -1786,5 +1911,5 @@ def create_embeddings_from_env() -> Embeddings:
         raise ValueError(
             f"Unknown embeddings provider: {provider}. "
             f"Supported: 'local', 'onnx', 'tei', 'openai', 'openai-codex', 'openrouter', 'requesty', 'cohere', 'google', "
-            f"'zeroentropy', 'litellm', 'litellm-sdk'"
+            f"'zeroentropy', 'ollama', 'litellm', 'litellm-sdk'"
         )
