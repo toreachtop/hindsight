@@ -16,7 +16,12 @@ No alembic.ini required - all configuration is done programmatically.
 """
 
 import hashlib
+import json
 import logging
+import os
+import subprocess
+import sys
+import sysconfig
 import threading
 import time
 from pathlib import Path
@@ -28,7 +33,9 @@ from alembic.util.exc import CommandError
 from sqlalchemy import Connection, create_engine, text
 from sqlalchemy.pool import NullPool
 
+from ._free_threading import ENV_FREE_THREADING
 from ._pg_search import normalize_pg_search_tokenizer, pg_search_bm25_columns
+from ._text_search import mental_models_text_document
 from ._vector_index import (
     bootstrap_extension,
     configured_vector_extension,
@@ -39,10 +46,14 @@ from ._vector_index import (
     should_defer_index_creation,
     uses_per_bank_vector_indexes,
 )
+from .config import ENV_MIGRATION_ISOLATION, get_config
 from .db_url import is_oracle_url, to_libpq_url
 from .utils import mask_network_location
 
 logger = logging.getLogger(__name__)
+
+#: Set in the migration child's env so it does not spawn a child of its own.
+_CHILD_MARKER = "_HINDSIGHT_MIGRATION_CHILD"
 
 # Advisory lock ID for migrations (arbitrary unique number)
 MIGRATION_LOCK_ID = 123456789
@@ -237,6 +248,91 @@ def _run_migrations_internal(database_url: str, script_location: str, schema: st
     logger.info(f"Database migrations completed successfully for schema '{schema_name}'")
 
 
+def _should_isolate_migrations() -> bool:
+    """Whether to run the migration in a subprocess instead of in this process.
+
+    Controlled by ``HINDSIGHT_API_MIGRATION_ISOLATION``:
+
+        auto    (default) isolate only on a free-threaded interpreter
+        true    isolate everywhere — useful to keep alembic's import graph and its
+                sync engine out of a long-lived server process regardless
+        false   never isolate; the historical behaviour
+
+    "auto" exists because of psycopg2. Alembic drives PostgreSQL through SQLAlchemy's
+    sync engine, and psycopg2 has no free-threaded build: importing it on a
+    ``python3.14t`` interpreter re-enables the GIL for the life of the process. A
+    server that migrates on startup would therefore spend the rest of its life
+    single-threaded, having done the damage before serving a single request.
+
+    ``_CHILD_MARKER`` stops the child from recursing.
+    """
+    if os.environ.get(_CHILD_MARKER):
+        return False
+    mode = get_config().migration_isolation
+    if mode == "true":
+        return True
+    if mode == "false":
+        return False
+    return bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
+
+
+def _run_in_migration_child(target: str, kwargs: dict) -> None:
+    """Run the migration in a subprocess so this process never imports psycopg2.
+
+    Alembic drives PostgreSQL through SQLAlchemy's sync engine, i.e. psycopg2, which
+    has no free-threaded build. Importing it on a ``python3.14t`` interpreter re-enables
+    the GIL for the life of the process -- so a server that migrates on startup would
+    spend the rest of its life single-threaded, having done the damage before it served
+    a single request.
+
+    The boundary is the whole migration entrypoint rather than each ``create_engine``
+    call: schema migration also reaches ``ensure_embedding_dimension`` and the vector /
+    text-search extension helpers, each of which opens its own sync engine. Isolating the
+    entrypoint covers all of them in one child instead of one spawn apiece.
+
+    The migration itself is short, rare and not on any hot path, so paying a process
+    spawn for it is free.
+
+    The payload goes over stdin, not argv: ``run_migrations_for_schemas`` is called
+    with every tenant schema at once, and at the scale that entrypoint is documented
+    for (20k schemas) the JSON is hundreds of KB — past ``ARG_MAX`` on macOS and close
+    to it on Linux, which would fail as ``E2BIG`` only on the largest deployments.
+
+    The child inherits stdout/stderr instead of having them captured. A full sweep can
+    run for the best part of an hour; capturing would hold every line until it finished
+    and show an operator nothing while it ran.
+    """
+    payload = json.dumps({"target": target, "kwargs": kwargs})
+    # The child imports psycopg2 deliberately — that is the entire reason it exists —
+    # so the free-threading guard has to be off inside it. Otherwise the guard the
+    # parent installs (strict by default on a free-threaded build, and inherited here)
+    # turns psycopg2's "the GIL has been enabled" warning into an exception and the
+    # migration fails.
+    #
+    # PYTHONWARNINGS is overwritten rather than merely cleared, for two reasons: the
+    # free-threaded CI job runs the suite with that warning promoted to an error and
+    # the child must not inherit it, and the warning is pure noise here — the child is
+    # SUPPOSED to take the GIL. Left visible it surfaces in the logs of a `-py3.14t`
+    # container as "the global interpreter lock (GIL) has been enabled", which reads
+    # like the image has silently lost its free-threading when it has not.
+    env = {
+        **os.environ,
+        ENV_MIGRATION_ISOLATION: "false",
+        ENV_FREE_THREADING: "off",
+        _CHILD_MARKER: "1",
+    }
+    env["PYTHONWARNINGS"] = "ignore:The global interpreter lock"
+    logger.info("Running migrations in a subprocess (psycopg2 needs the GIL; see %s)", ENV_MIGRATION_ISOLATION)
+    result = subprocess.run(
+        [sys.executable, "-m", "hindsight_api.migrations"],
+        input=payload,
+        env=env,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Migration subprocess failed (exit {result.returncode}); see the child's output above.")
+
+
 def run_migrations(
     database_url: str,
     script_location: str | None = None,
@@ -285,6 +381,20 @@ def run_migrations(
     # ineffective when the app URL goes through a pooler.  Configure
     # HINDSIGHT_API_MIGRATION_DATABASE_URL to the direct PostgreSQL endpoint
     # (e.g. hindsight-pg-rw) to restore correct locking behaviour.
+    # On a free-threaded interpreter, keep psycopg2 out of this process entirely.
+    # ``_CHILD_MARKER`` stops the child from recursing.
+    if _should_isolate_migrations():
+        _run_in_migration_child(
+            "run_migrations",
+            {
+                "database_url": database_url,
+                "script_location": script_location,
+                "schema": schema,
+                "migration_database_url": migration_database_url,
+            },
+        )
+        return
+
     raw_url = migration_database_url or database_url
     # Oracle URLs are passed through to SQLAlchemy unchanged; only PG URLs
     # need the libpq normalization (asyncpg → psycopg2 driver, ssl → sslmode).
@@ -624,33 +734,55 @@ def ensure_vector_extension(
             ).scalar()
 
             # Check current index type by querying pg_indexes
-            current_index_info = conn.execute(
+            current_index_rows = conn.execute(
                 text("""
-                    SELECT indexdef
+                    SELECT indexdef, indexname
                     FROM pg_indexes
                     WHERE schemaname = :schema
                       AND tablename = :table_name
                       AND indexname LIKE :index_pattern
                 """),
                 {"schema": schema_name, "table_name": table_name, "index_pattern": "%embedding%"},
-            ).fetchone()
+            ).fetchall()
 
-            if not current_index_info:
-                if table_name == "memory_units" and uses_per_bank_vector_indexes(target_ext):
-                    # Per-bank backends never use a GLOBAL memory_units vector index.
-                    # Every vector search is bank + fact_type scoped and served by the
-                    # per-(bank, fact_type) partial indexes created at bank-creation time
-                    # (bank_utils.create_bank_vector_indexes); the planner never picks a
-                    # global index when bank_id is in the WHERE clause, which is exactly
-                    # why migration d5e6f7a8b9c0 drops it for these backends. So don't
-                    # create one here either — not even on an empty schema with no per-bank
-                    # indexes yet (those are built when the first bank is created). Verified
-                    # via EXPLAIN: the query uses idx_mu_emb_* whether or not the global
-                    # index exists, so creating it is dead weight.
+            if table_name == "memory_units" and uses_per_bank_vector_indexes(target_ext):
+                # Per-bank backends never use a GLOBAL memory_units vector index.
+                # Every vector search is bank + fact_type scoped, and is served
+                # either by the bank's own partial index or — for a bank below
+                # the size threshold, which is most of them — by an exact
+                # (bank_id, fact_type) B-tree scan plus a top-N sort. The planner
+                # never picks a global index when bank_id is in the WHERE clause,
+                # which is exactly why migration d5e6f7a8b9c0 drops it for these
+                # backends. The partial indexes themselves are owned by the
+                # maintenance sweep (engine/vector_index_health.py), not by this
+                # reconcile and not by bank creation.
+                #
+                # The reconcile is strictly hands-off here, in BOTH directions:
+                # never create the index (dead weight — an older version of this
+                # branch did, which is how legacy schemas ended up carrying it),
+                # and never drop or rebuild one that exists. Runtime DROP/CREATE
+                # INDEX takes an ACCESS EXCLUSIVE lock on memory_units at
+                # unpredictable times (startup, tenant provisioning); index DDL
+                # belongs in the versioned migration path. Leftover globals are
+                # removed by migration f2a6d8c4b1e9. This continue also keeps
+                # memory_units out of the type-mismatch reconcile below, which
+                # would otherwise recreate a global index with the new type on a
+                # backend switch.
+                if current_index_rows:
+                    stale_names = ", ".join(row[1] for row in current_index_rows)
+                    logger.info(
+                        f"Global vector index ({stale_names}) present on {schema_name}.memory_units "
+                        f"with per-bank backend ({target_ext}); left untouched — removed by "
+                        f"migration f2a6d8c4b1e9"
+                    )
+                else:
                     logger.debug(
                         f"Per-bank vector backend ({target_ext}); skipping global {index_name} creation on {table_name}"
                     )
-                    continue
+                continue
+
+            current_index_info = current_index_rows[0] if current_index_rows else None
+            if not current_index_info:
                 logger.warning(f"No embedding index found for {table_name}, will create it if safe")
                 mismatched_tables.append((table_name, index_name, None, row_count))
                 continue
@@ -765,6 +897,34 @@ def ensure_vector_extension(
         logger.info(f"Successfully reconciled vector indexes for {target_ext}")
 
 
+def _reconcile_needs_no_backfill(
+    text_search_extension: str,
+    table_name: str,
+    current_column_type: str | None,
+    current_index_type: str | None,
+) -> bool:
+    """Is this mismatch safe to reconcile even though the table holds rows?
+
+    Only one transition qualifies: ``mental_models`` sitting on the migration-time
+    native tsvector projection while pgroonga is configured. pgroonga indexes
+    ``name + content`` directly, so the replacement ``search_vector`` is a dummy
+    column with nothing to backfill — dropping the derived tsvector loses no data
+    the reconciler would have to recompute.
+
+    This state exists on every pgroonga deployment because the reconciler used to
+    check the pre-rename ``reflections`` table name and therefore never converted
+    mental models (issue #3307). Every other transition (anything writing
+    ``memory_units``, or a target column that stores a per-row tsvector/bm25vector)
+    needs values only the write path can produce, so it stays fail-closed.
+    """
+    return (
+        text_search_extension == "pgroonga"
+        and table_name == "mental_models"
+        and current_column_type == "tsvector"
+        and current_index_type in {None, "gin"}
+    )
+
+
 def ensure_text_search_extension(
     database_url: str,
     text_search_extension: str = "native",
@@ -778,7 +938,9 @@ def ensure_text_search_extension(
     in the database and adjusts them if necessary:
     - If they match configured extension: no action needed
     - If they differ and tables are empty: drop old column/index, recreate with new type
-    - If they differ and tables have data: raise error with migration guidance
+    - If they differ and tables have data: raise error with migration guidance,
+      except for the mental-model native-to-pgroonga transition, which needs no
+      backfill (pgroonga indexes the base columns) and so is safe while populated
 
     Args:
         database_url: SQLAlchemy database URL
@@ -798,10 +960,7 @@ def ensure_text_search_extension(
     engine = create_engine(to_libpq_url(database_url), poolclass=NullPool)
     with engine.connect() as conn:
         # Tables with search_vector columns to check
-        tables_to_check = [
-            "memory_units",
-            "reflections",  # Renamed from pinned_reflections in p1k2l3m4n5o6 migration
-        ]
+        tables_to_check = ["memory_units", "mental_models"]
 
         # Determine target column type and index type
         if text_search_extension == "vchord":
@@ -811,7 +970,7 @@ def ensure_text_search_extension(
             target_column_type = "text"
             target_index_type = "bm25"
         elif text_search_extension == "pgroonga":
-            # pgroonga indexes the base text column directly. We keep a dummy
+            # pgroonga indexes the base text columns directly. We keep a dummy
             # TEXT column named search_vector for symmetry with pg_textsearch
             # and so the column-type mismatch detection above keeps working.
             target_column_type = "text"
@@ -871,13 +1030,19 @@ def ensure_text_search_extension(
                 text("""
                     SELECT am.amname, pi.indexdef
                     FROM pg_indexes pi
-                    JOIN pg_class c ON c.relname = pi.indexname
+                    JOIN pg_class c
+                      ON c.relname = pi.indexname
+                     AND c.relnamespace = to_regnamespace(pi.schemaname)
                     JOIN pg_am am ON am.oid = c.relam
                     WHERE pi.schemaname = :schema
                       AND pi.tablename = :table_name
-                      AND pi.indexname LIKE '%text_search%'
+                      AND pi.indexname = :index_name
                 """),
-                {"schema": schema_name, "table_name": table_name},
+                {
+                    "schema": schema_name,
+                    "table_name": table_name,
+                    "index_name": f"idx_{table_name.replace('.', '_')}_text_search",
+                },
             ).fetchone()
 
             current_index_type = current_index_info[0] if current_index_info else None
@@ -908,7 +1073,12 @@ def ensure_text_search_extension(
                 # Check if table has data
                 row_count = conn.execute(text(f"SELECT COUNT(*) FROM {schema_name}.{table_name}")).scalar()
 
-                if row_count > 0:
+                if row_count > 0 and not _reconcile_needs_no_backfill(
+                    text_search_extension,
+                    table_name,
+                    current_column_type,
+                    current_index_type,
+                ):
                     tables_with_data.append((table_name, row_count))
             else:
                 logger.debug(f"Text search OK for {table_name}: {current_column_type}/{current_index_type}")
@@ -942,11 +1112,17 @@ def ensure_text_search_extension(
                 f"the following tables contain data: {table_list}. "
                 f"To change text search extension, you must either:\n"
                 f"  1. Clear all data: DELETE FROM {schema_name}.memory_units; "
-                f"DELETE FROM {schema_name}.reflections; then restart\n"
+                f"DELETE FROM {schema_name}.mental_models; then restart\n"
                 f"  2. Use the current text search extension (set HINDSIGHT_API_TEXT_SEARCH_EXTENSION='{current_ext}')"
             )
 
-        # Tables are empty, safe to recreate columns/indexes
+        # Tables are empty, except for the backfill-free mental-model
+        # native-to-pgroonga transition admitted above.
+        #
+        # Every statement below is written to be safely re-executable: replicas
+        # boot concurrently during a rolling restart and each runs this
+        # reconciliation, so a plain CREATE/ADD would crash whichever replica
+        # loses the race to the first one's committed DDL.
         logger.info(f"Recreating text search columns/indexes for {text_search_extension}")
 
         for table_name, current_col_type, current_idx_type, _was_pg_search in mismatched_tables:
@@ -969,14 +1145,17 @@ def ensure_text_search_extension(
                 logger.info(f"Creating bm25vector column on {table_name}")
                 # Note: vchord_bm25 extension creates types in bm25_catalog schema
                 conn.execute(
-                    text(f"ALTER TABLE {schema_name}.{table_name} ADD COLUMN search_vector bm25_catalog.bm25vector")
+                    text(
+                        f"ALTER TABLE {schema_name}.{table_name} "
+                        f"ADD COLUMN IF NOT EXISTS search_vector bm25_catalog.bm25vector"
+                    )
                 )
 
                 # Create BM25 index
                 logger.info(f"Creating BM25 index on {table_name}")
                 conn.execute(
                     text(f"""
-                        CREATE INDEX idx_{table_name.replace(".", "_")}_text_search
+                        CREATE INDEX IF NOT EXISTS idx_{table_name.replace(".", "_")}_text_search
                         ON {schema_name}.{table_name}
                         USING bm25 (search_vector bm25_catalog.bm25_ops)
                     """)
@@ -984,19 +1163,21 @@ def ensure_text_search_extension(
             elif text_search_extension == "pg_textsearch":
                 logger.info(f"Creating TEXT column on {table_name}")
                 # Dummy TEXT column for consistency (indexes operate on base columns)
-                conn.execute(text(f"ALTER TABLE {schema_name}.{table_name} ADD COLUMN search_vector TEXT"))
+                conn.execute(
+                    text(f"ALTER TABLE {schema_name}.{table_name} ADD COLUMN IF NOT EXISTS search_vector TEXT")
+                )
 
                 # Create BM25 index on expression
                 logger.info(f"Creating BM25 index on {table_name}")
                 # Different expression for each table
                 if table_name == "memory_units":
                     index_expr = "(COALESCE(text, '') || ' ' || COALESCE(context, ''))"
-                else:  # reflections
-                    index_expr = "(COALESCE(name, '') || ' ' || content)"
+                else:  # mental_models
+                    index_expr = mental_models_text_document()
 
                 conn.execute(
                     text(f"""
-                        CREATE INDEX idx_{table_name.replace(".", "_")}_text_search
+                        CREATE INDEX IF NOT EXISTS idx_{table_name.replace(".", "_")}_text_search
                         ON {schema_name}.{table_name}
                         USING bm25({index_expr})
                         WITH (text_config='english')
@@ -1013,18 +1194,20 @@ def ensure_text_search_extension(
                         raise
 
                 logger.info(f"Creating dummy TEXT search_vector on {table_name} for pgroonga")
-                # pgroonga indexes the base text column directly, but we keep a
+                # pgroonga indexes the base text columns directly, but we keep a
                 # dummy search_vector column for symmetry with pg_textsearch and
                 # so the column-type mismatch detection above keeps working.
-                conn.execute(text(f"ALTER TABLE {schema_name}.{table_name} ADD COLUMN search_vector TEXT"))
+                conn.execute(
+                    text(f"ALTER TABLE {schema_name}.{table_name} ADD COLUMN IF NOT EXISTS search_vector TEXT")
+                )
 
                 # pgroonga index expression mirrors pg_textsearch
                 if table_name == "memory_units":
                     index_expr = (
                         "(COALESCE(text, '') || ' ' || COALESCE(context, '') || ' ' || COALESCE(text_signals, ''))"
                     )
-                else:  # reflections
-                    index_expr = "(COALESCE(name, '') || ' ' || content)"
+                else:  # mental_models — knowledge_bm25_arm repeats this verbatim
+                    index_expr = mental_models_text_document()
 
                 logger.info(f"Creating pgroonga index on {table_name}")
                 # TokenBigram is the polyglot default — falls back to whitespace
@@ -1033,7 +1216,7 @@ def ensure_text_search_extension(
                 # case folding, etc.) which materially improves Japanese recall.
                 conn.execute(
                     text(f"""
-                        CREATE INDEX idx_{table_name.replace(".", "_")}_text_search
+                        CREATE INDEX IF NOT EXISTS idx_{table_name.replace(".", "_")}_text_search
                         ON {schema_name}.{table_name}
                         USING pgroonga ({index_expr})
                         WITH (tokenizer='TokenBigram', normalizer='NormalizerNFKC150')
@@ -1042,7 +1225,9 @@ def ensure_text_search_extension(
             elif text_search_extension == "pg_search":
                 logger.info(f"Creating TEXT column on {table_name}")
                 # Dummy TEXT column for schema symmetry; pg_search indexes operate on base columns.
-                conn.execute(text(f"ALTER TABLE {schema_name}.{table_name} ADD COLUMN search_vector TEXT"))
+                conn.execute(
+                    text(f"ALTER TABLE {schema_name}.{table_name} ADD COLUMN IF NOT EXISTS search_vector TEXT")
+                )
 
                 # ParadeDB BM25 index over the table's primary key and text columns.
                 # Column list mirrors what the initial / text_signals migrations create.
@@ -1052,7 +1237,7 @@ def ensure_text_search_extension(
                         ("text", "context", "text_signals"),
                         pg_search_tokenizer,
                     )
-                else:  # reflections
+                else:  # mental_models
                     bm25_cols = pg_search_bm25_columns(
                         "id",
                         ("name", "content"),
@@ -1062,7 +1247,7 @@ def ensure_text_search_extension(
                 logger.info(f"Creating ParadeDB BM25 index on {table_name}")
                 conn.execute(
                     text(f"""
-                        CREATE INDEX idx_{table_name.replace(".", "_")}_text_search
+                        CREATE INDEX IF NOT EXISTS idx_{table_name.replace(".", "_")}_text_search
                         ON {schema_name}.{table_name}
                         USING bm25 ({bm25_cols})
                         WITH (key_field='id')
@@ -1070,17 +1255,35 @@ def ensure_text_search_extension(
                 )
             else:  # native
                 logger.info(f"Creating tsvector column on {table_name}")
-                # Plain tsvector column. The application populates search_vector
-                # at INSERT time via to_tsvector($lang, ...) using the configured
-                # HINDSIGHT_API_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE — see
-                # ops_postgresql.insert_facts_batch.
-                conn.execute(text(f"ALTER TABLE {schema_name}.{table_name} ADD COLUMN search_vector tsvector"))
+                if table_name == "mental_models":
+                    # No write path populates mental_models.search_vector for
+                    # native (pg_search_vector_expr passes native_inline=False),
+                    # so it must be GENERATED exactly like the learnings /
+                    # pinned_reflections migration creates it — a plain column
+                    # here would stay NULL and silently empty knowledge search.
+                    # The 'english' config is hard-coded there and in
+                    # knowledge_bm25_arm's native branch; keep all three in step.
+                    conn.execute(
+                        text(f"""
+                            ALTER TABLE {schema_name}.{table_name}
+                            ADD COLUMN IF NOT EXISTS search_vector tsvector
+                            GENERATED ALWAYS AS (
+                                to_tsvector('english', {mental_models_text_document()})
+                            ) STORED
+                        """)
+                    )
+                else:
+                    # memory_units writes populate this plain column with the
+                    # configured native language in ops_postgresql.
+                    conn.execute(
+                        text(f"ALTER TABLE {schema_name}.{table_name} ADD COLUMN IF NOT EXISTS search_vector tsvector")
+                    )
 
                 # Create GIN index
                 logger.info(f"Creating GIN index on {table_name}")
                 conn.execute(
                     text(f"""
-                        CREATE INDEX idx_{table_name.replace(".", "_")}_text_search
+                        CREATE INDEX IF NOT EXISTS idx_{table_name.replace(".", "_")}_text_search
                         ON {schema_name}.{table_name}
                         USING gin(search_vector)
                     """)
@@ -1175,6 +1378,26 @@ def run_migrations_for_schemas(
     Failures are collected per schema and re-raised together so one bad tenant
     does not hide the status of the others.
     """
+    # Free-threaded build: keep psycopg2 (and every sync engine this reaches --
+    # ensure_embedding_dimension, the vector and text-search extension helpers) out of
+    # the caller's process. One child covers the whole sweep.
+    if _should_isolate_migrations():
+        _run_in_migration_child(
+            "run_migrations_for_schemas",
+            {
+                "database_url": database_url,
+                "schemas": schemas,
+                "concurrency": concurrency,
+                "migration_database_url": migration_database_url,
+                "embedding_dimension": embedding_dimension,
+                "vector_extension": vector_extension,
+                "text_search_extension": text_search_extension,
+                "pg_search_tokenizer": pg_search_tokenizer,
+                "ensure_extensions": ensure_extensions,
+            },
+        )
+        return
+
     if not schemas:
         return
 
@@ -1214,3 +1437,28 @@ def run_migrations_for_schemas(
         raise RuntimeError(
             f"Database migrations failed for {len(errors)} of {len(schemas)} schema(s): {failed}"
         ) from next(iter(errors.values()))
+
+
+def _main() -> None:
+    """Entry point for the migration subprocess (see ``_run_in_migration_child``).
+
+    Invoked as ``python -m hindsight_api.migrations`` with the JSON payload on stdin.
+    Kept deliberately thin: it exists only so the psycopg2 import happens in a process
+    that is allowed to have the GIL, and it re-enters ``run_migrations`` with
+    ``_CHILD_MARKER`` set so the subprocess branch is skipped.
+    """
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    payload = json.loads(sys.stdin.read())
+    os.environ[_CHILD_MARKER] = "1"
+    targets = {
+        "run_migrations": run_migrations,
+        "run_migrations_for_schemas": run_migrations_for_schemas,
+    }
+    target = payload["target"]
+    if target not in targets:
+        raise SystemExit(f"unknown migration target {target!r}; expected one of {sorted(targets)}")
+    targets[target](**payload["kwargs"])
+
+
+if __name__ == "__main__":
+    _main()

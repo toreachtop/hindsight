@@ -34,9 +34,32 @@ describe("documentHarness", () => {
 });
 
 describe("resolveHarnessLogo", () => {
-  // The exact set hindsight-coding-agents emits (src/harness/hook-lifecycle.ts
-  // + registry.ts). The registry must cover these and nothing speculative.
-  const EMITTED_HARNESSES = ["claude-code", "codex", "cursor-cli", "gemini", "opencode"];
+  // The exact set hindsight-coding-agents emits: one per HookSpec in
+  // src/harness/hook-lifecycle.ts, plus the persistent-plugin harnesses whose id
+  // is their entrypoint's argument to the shared factory they use (opencode,
+  // opencode2, kilo, cline-cli, pi, prime-agent). The registry must cover these
+  // and nothing speculative.
+  const EMITTED_HARNESSES = [
+    "antigravity-cli",
+    "claude-code",
+    "cline-cli",
+    "codex",
+    "dcode",
+    "copilot-cli",
+    "cursor-cli",
+    "devin-cli",
+    "dsh",
+    "grok-build",
+    "kilo",
+    "opencode",
+    "opencode2",
+    "pi",
+    "prime-agent",
+    "qwen-code",
+  ];
+  // Ids the integration used to emit. Kept so documents already retained under
+  // them keep their logo; a new id never belongs here.
+  const RETIRED_HARNESSES = ["gemini"];
 
   it("resolves every id the coding-agent integration emits", () => {
     for (const id of EMITTED_HARNESSES) {
@@ -45,7 +68,9 @@ describe("resolveHarnessLogo", () => {
   });
 
   it("registers no harness that nothing writes", () => {
-    expect(Object.keys(HARNESS_LOGO_REGISTRY).sort()).toEqual([...EMITTED_HARNESSES].sort());
+    expect(Object.keys(HARNESS_LOGO_REGISTRY).sort()).toEqual(
+      [...EMITTED_HARNESSES, ...RETIRED_HARNESSES].sort()
+    );
   });
 
   it("normalizes case, spacing and underscores", () => {

@@ -67,10 +67,7 @@ The split is decided by **who is speaking**, not by grammar. A first-person stat
 - Agent's own log — "I patched the auth bug" → **experience** (the agent did it).
 - A user talking to the agent — "I bought a Tesla" → **world** (a fact about the *user*, not the agent).
 
-Two things steer this correctly:
-
-- **Set a human-readable bank `name`** (the agent's name). It identifies who "the agent" is. If left unset it defaults to the `bank_id`; a `bank_id` that is a routing key (e.g. `my-agent::channel-456::user-789`) is not a usable speaker name, so give the bank a real name.
-- **Describe the speaker in each item's `context`** when retaining transcripts or third-party content. For a chat log, a context like *"Customer Maria is speaking"* ensures her first-person statements are stored as `world` facts about Maria rather than mistaken for the agent's own experiences. The `context` takes precedence over the bank name when the two disagree.
+**Describe the speaker in each item's `context`** to steer this correctly. When retaining transcripts or third-party content, a context like *"Customer Maria is speaking"* ensures her first-person statements are stored as `world` facts about Maria rather than mistaken for the agent's own experiences. For the agent's own logs, a context like *"The assistant is speaking"* attributes its first-person statements to the agent as `experience` facts.
 
 **Note:** Observations are consolidated automatically in the background after `retain()` operations complete. This consolidation process synthesizes patterns from new facts into the bank's knowledge base.
 
@@ -96,6 +93,8 @@ Because resolution keys off name similarity, close variants merge automatically.
 
 **Why it matters:** You can ask "What do I know about Alice?" and get everything, even if she was mentioned as "Alice Chen" in some conversations.
 
+Resolution is a judgement call, so it can go the other way too: on a bank with a lot of history, a short new name that resembles an existing entity — and that turns up alongside entities the existing one is already associated with — can be absorbed into it instead of becoming its own entity. If you see facts about a new person attached to an unrelated entity, [How entity resolution decides](configuration.md#how-entity-resolution-decides) explains what is being compared and which setting makes matching stricter.
+
 ### Context-Aware Disambiguation
 
 If "Alice" appears with "Google" and "Stanford" multiple times, a new "Alice" mentioning those is likely the same person. Hindsight uses co-occurrence patterns to disambiguate common names.
@@ -103,6 +102,8 @@ If "Alice" appears with "Google" and "Stanford" multiple times, a new "Alice" me
 ### Entity Labels
 
 You can define a controlled vocabulary of `key:value` classification labels (e.g. `pedagogy:scaffolding`, `engagement:active`) that are extracted at retain time and stored as entities. Because labels become entities, they automatically link related memories in the knowledge graph and improve both semantic and keyword retrieval. Labels can optionally also write to the memory unit's tags, enabling standard tag-based filtering during recall and reflect.
+
+Unlike regular entities, label entities never merge by name similarity — distinct label values must stay distinct, so they resolve by exact match only and are excluded from fuzzy name matching altogether.
 
 See [entity_labels in the bank config](api/memory-banks.md#entity-labels) for full configuration details.
 
@@ -201,7 +202,7 @@ e.g. Always include technical decisions, API design choices, and architectural t
      Ignore meeting logistics, greetings, and social exchanges.
 ```
 
-The mission is injected into the extraction prompt alongside the built-in rules — it steers the LLM without replacing the extraction logic. It works with any extraction mode (`concise`, `verbose`, `custom`).
+The mission is injected into the extraction prompt alongside the built-in rules — it steers the LLM without replacing the extraction logic. It works with the LLM-based extraction modes (`concise`, `verbose`, `verbatim`, `custom`) and is ignored in `chunks` mode.
 
 For finer control, you can also change the **extraction mode**:
 
@@ -210,8 +211,10 @@ For finer control, you can also change the **extraction mode**:
 | `concise` *(default)* | General-purpose — selective, fast |
 | `verbose` | When you need richer facts with full context and relationships |
 | `custom` | When you want to write your own extraction rules entirely |
+| `verbatim` | When you need the original chunk text preserved, with LLM-extracted metadata such as entities and dates |
+| `chunks` | When you want to store chunks as-is with no LLM call or extracted metadata |
 
-Set `retain_mission` and `retain_extraction_mode` via the [bank config API](api/memory-banks.md#retain-configuration) or the [`HINDSIGHT_API_RETAIN_MISSION`](configuration.md#retain) environment variable.
+Set `retain_mission` and `retain_extraction_mode` via the [bank config API](api/memory-banks.md#retain-configuration), or with the [`HINDSIGHT_API_RETAIN_MISSION`](configuration.md#retain) and [`HINDSIGHT_API_RETAIN_EXTRACTION_MODE`](configuration.md#retain) environment variables.
 
 ### When a mission excludes everything in a document
 

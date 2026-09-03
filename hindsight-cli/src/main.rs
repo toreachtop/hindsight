@@ -67,7 +67,7 @@ fn get_after_help() -> String {
 }
 
 fn get_before_help() -> &'static str {
-    ui::get_logo()
+    ui::before_help_logo()
 }
 
 #[derive(Subcommand)]
@@ -103,6 +103,10 @@ enum Commands {
     /// Manage mental models (user-curated summaries)
     #[command(subcommand)]
     MentalModel(MentalModelCommands),
+
+    /// Manage the knowledge base (folder/page tree, search, export)
+    #[command(subcommand)]
+    KnowledgeBase(KnowledgeBaseCommands),
 
     /// Manage directives (behavioral rules)
     #[command(subcommand)]
@@ -539,6 +543,14 @@ enum MemoryCommands {
         /// Prefer observations: drop raw facts a returned observation was consolidated from (no effect unless observation + a raw type are both recalled)
         #[arg(long)]
         prefer_observations: bool,
+
+        /// Start of the time window to search over (ISO 8601; no offset means UTC). Requires --window-end
+        #[arg(long)]
+        window_start: Option<String>,
+
+        /// End of the time window. Ranks memories dated in the window higher; it does not hide the ones outside it
+        #[arg(long)]
+        window_end: Option<String>,
     },
 
     /// Generate answers using bank identity (reflect/reasoning)
@@ -1040,6 +1052,11 @@ enum MentalModelCommands {
         /// Refresh this mental model automatically after observations consolidation
         #[arg(long)]
         trigger_refresh_after_consolidation: bool,
+
+        /// Refresh mode: full (default) regenerates the content from scratch on
+        /// each refresh, delta edits the existing content in place
+        #[arg(long)]
+        trigger_mode: Option<String>,
     },
 
     /// Update a mental model
@@ -1069,6 +1086,35 @@ enum MentalModelCommands {
         /// Enable/disable automatic refresh after observations consolidation
         #[arg(long)]
         trigger_refresh_after_consolidation: Option<bool>,
+
+        /// Refresh mode: full or delta. Trigger settings you do not pass keep
+        /// their stored values.
+        #[arg(long)]
+        trigger_mode: Option<String>,
+
+        /// Cron expression (UTC, 5-field, e.g. '0 3 * * *') for scheduled
+        /// refreshes. Setting one turns off refresh-after-consolidation, which
+        /// it is mutually exclusive with. Empty string removes the schedule
+        #[arg(long)]
+        trigger_refresh_cron: Option<String>,
+
+        /// Minimum seconds between two automatic refreshes (0 disables the floor)
+        #[arg(long)]
+        trigger_min_refresh_interval_seconds: Option<u64>,
+
+        /// How the model's tags filter memories during refresh: any, all,
+        /// any_strict, all_strict, exact. Pass an empty string to fall back to
+        /// the server default
+        #[arg(long)]
+        trigger_tags_match: Option<String>,
+
+        /// Record how each refresh reached its result under reflect_response.trace
+        #[arg(long)]
+        trigger_keep_trace: Option<bool>,
+
+        /// Exclude all mental models from the reflect loop during refresh
+        #[arg(long)]
+        trigger_exclude_mental_models: Option<bool>,
     },
 
     /// Delete a mental model
@@ -1093,6 +1139,15 @@ enum MentalModelCommands {
         mental_model_id: String,
     },
 
+    /// Preview a refresh without changing the mental model
+    DryRunRefresh {
+        /// Bank ID
+        bank_id: String,
+
+        /// Mental model ID
+        mental_model_id: String,
+    },
+
     /// Get the change history of a mental model
     History {
         /// Bank ID
@@ -1100,6 +1155,132 @@ enum MentalModelCommands {
 
         /// Mental model ID
         mental_model_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum KnowledgeBaseCommands {
+    /// Show the folder/page tree for a bank
+    Tree {
+        /// Bank ID
+        bank_id: String,
+    },
+
+    /// Create a folder
+    CreateFolder {
+        /// Bank ID
+        bank_id: String,
+
+        /// Folder name
+        name: String,
+
+        /// Parent folder ID (omit to create at the root)
+        #[arg(long)]
+        parent_id: Option<String>,
+    },
+
+    /// Create a page (content is generated in the background)
+    CreatePage {
+        /// Bank ID
+        bank_id: String,
+
+        /// Page name (must be unique within its folder)
+        name: String,
+
+        /// The question the page answers, re-asked on every refresh
+        source_query: String,
+
+        /// Parent folder ID (omit to create at the root)
+        #[arg(long)]
+        parent_id: Option<String>,
+
+        /// Tags scoping which memories the page is built from (comma-separated).
+        /// A `type:<x>` tag also sets the page's rendered type.
+        #[arg(long, value_delimiter = ',')]
+        tags: Vec<String>,
+
+        /// Maximum tokens for generated content (server default: 4096)
+        #[arg(long)]
+        max_tokens: Option<i64>,
+
+        /// Refresh mode: full or delta. Omit to keep the page default (delta).
+        #[arg(long)]
+        mode: Option<String>,
+
+        /// Fact types the page is built from (comma-separated): world,
+        /// experience, observation. Omit to keep the page default (observation).
+        #[arg(long, value_delimiter = ',')]
+        fact_types: Vec<String>,
+    },
+
+    /// Read a page as a markdown document
+    GetPage {
+        /// Bank ID
+        bank_id: String,
+
+        /// Page ID
+        page_id: String,
+    },
+
+    /// Search pages (hybrid full-text + vector)
+    Search {
+        /// Bank ID
+        bank_id: String,
+
+        /// Search query
+        query: String,
+
+        /// Maximum results to return (1-50)
+        #[arg(long)]
+        limit: Option<u64>,
+    },
+
+    /// Rename/move a node, or update a page's options
+    Update {
+        /// Bank ID
+        bank_id: String,
+
+        /// Folder or page ID
+        node_id: String,
+
+        /// New name
+        #[arg(long)]
+        name: Option<String>,
+
+        /// New parent folder ID
+        #[arg(long)]
+        parent_id: Option<String>,
+
+        /// Pages only: new question. Changing it rebuilds the page.
+        #[arg(long)]
+        source_query: Option<String>,
+
+        /// Pages only: replace tags (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        tags: Option<Vec<String>>,
+
+        /// Pages only: new maximum tokens for generated content
+        #[arg(long)]
+        max_tokens: Option<i64>,
+    },
+
+    /// Delete a folder or page and its whole subtree
+    Delete {
+        /// Bank ID
+        bank_id: String,
+
+        /// Folder or page ID
+        node_id: String,
+
+        /// Skip the confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
+    },
+
+    /// Export the knowledge base as a markdown bundle
+    Export {
+        /// Bank ID
+        bank_id: String,
     },
 }
 
@@ -1435,6 +1616,8 @@ fn run() -> Result<()> {
                 tags_match,
                 query_timestamp,
                 prefer_observations,
+                window_start,
+                window_end,
             } => commands::memory::recall(
                 &client,
                 &bank_id,
@@ -1449,6 +1632,8 @@ fn run() -> Result<()> {
                 tags_match,
                 query_timestamp,
                 prefer_observations,
+                window_start,
+                window_end,
                 verbose,
                 output_format,
             ),
@@ -1691,6 +1876,7 @@ fn run() -> Result<()> {
                 max_tokens,
                 tags_match,
                 trigger_refresh_after_consolidation,
+                trigger_mode,
             } => commands::mental_model::create(
                 &client,
                 &bank_id,
@@ -1701,6 +1887,7 @@ fn run() -> Result<()> {
                 max_tokens,
                 tags_match.as_deref(),
                 trigger_refresh_after_consolidation,
+                trigger_mode.as_deref(),
                 verbose,
                 output_format,
             ),
@@ -1712,6 +1899,12 @@ fn run() -> Result<()> {
                 max_tokens,
                 tags,
                 trigger_refresh_after_consolidation,
+                trigger_mode,
+                trigger_refresh_cron,
+                trigger_min_refresh_interval_seconds,
+                trigger_tags_match,
+                trigger_keep_trace,
+                trigger_exclude_mental_models,
             } => commands::mental_model::update(
                 &client,
                 &bank_id,
@@ -1720,7 +1913,15 @@ fn run() -> Result<()> {
                 source_query,
                 max_tokens,
                 tags,
-                trigger_refresh_after_consolidation,
+                &commands::mental_model::TriggerUpdate {
+                    mode: trigger_mode,
+                    refresh_after_consolidation: trigger_refresh_after_consolidation,
+                    refresh_cron: trigger_refresh_cron,
+                    min_refresh_interval_seconds: trigger_min_refresh_interval_seconds,
+                    tags_match: trigger_tags_match,
+                    keep_trace: trigger_keep_trace,
+                    exclude_mental_models: trigger_exclude_mental_models,
+                },
                 verbose,
                 output_format,
             ),
@@ -1746,6 +1947,16 @@ fn run() -> Result<()> {
                 verbose,
                 output_format,
             ),
+            MentalModelCommands::DryRunRefresh {
+                bank_id,
+                mental_model_id,
+            } => commands::mental_model::dry_run_refresh(
+                &client,
+                &bank_id,
+                &mental_model_id,
+                verbose,
+                output_format,
+            ),
             MentalModelCommands::History {
                 bank_id,
                 mental_model_id,
@@ -1756,6 +1967,103 @@ fn run() -> Result<()> {
                 verbose,
                 output_format,
             ),
+        },
+
+        // Knowledge base commands
+        Commands::KnowledgeBase(kb_cmd) => match kb_cmd {
+            KnowledgeBaseCommands::Tree { bank_id } => {
+                commands::knowledge_base::tree(&client, &bank_id, verbose, output_format)
+            }
+            KnowledgeBaseCommands::CreateFolder {
+                bank_id,
+                name,
+                parent_id,
+            } => commands::knowledge_base::create_folder(
+                &client,
+                &bank_id,
+                &name,
+                parent_id.as_deref(),
+                verbose,
+                output_format,
+            ),
+            KnowledgeBaseCommands::CreatePage {
+                bank_id,
+                name,
+                source_query,
+                parent_id,
+                tags,
+                max_tokens,
+                mode,
+                fact_types,
+            } => commands::knowledge_base::create_page(
+                &client,
+                &bank_id,
+                &name,
+                &source_query,
+                parent_id.as_deref(),
+                tags,
+                max_tokens,
+                mode.as_deref(),
+                fact_types,
+                verbose,
+                output_format,
+            ),
+            KnowledgeBaseCommands::GetPage { bank_id, page_id } => {
+                commands::knowledge_base::get_page(
+                    &client,
+                    &bank_id,
+                    &page_id,
+                    verbose,
+                    output_format,
+                )
+            }
+            KnowledgeBaseCommands::Search {
+                bank_id,
+                query,
+                limit,
+            } => commands::knowledge_base::search(
+                &client,
+                &bank_id,
+                &query,
+                limit,
+                verbose,
+                output_format,
+            ),
+            KnowledgeBaseCommands::Update {
+                bank_id,
+                node_id,
+                name,
+                parent_id,
+                source_query,
+                tags,
+                max_tokens,
+            } => commands::knowledge_base::update(
+                &client,
+                &bank_id,
+                &node_id,
+                name,
+                parent_id,
+                source_query,
+                tags,
+                max_tokens,
+                verbose,
+                output_format,
+            ),
+            KnowledgeBaseCommands::Delete {
+                bank_id,
+                node_id,
+                yes,
+            } => commands::knowledge_base::delete(
+                &client,
+                &bank_id,
+                &node_id,
+                yes,
+                verbose,
+                output_format,
+            ),
+            KnowledgeBaseCommands::Export { bank_id } => {
+                commands::knowledge_base::export(&client, &bank_id, verbose, output_format)
+            }
         },
 
         // Directive commands
@@ -1959,11 +2267,10 @@ fn handle_configure(
 
     // Validate the URL
     if !new_api_url.starts_with("http://") && !new_api_url.starts_with("https://") {
-        ui::print_error(&format!(
+        anyhow::bail!(
             "Invalid API URL: {}. Must start with http:// or https://",
             new_api_url
-        ));
-        return Ok(());
+        );
     }
 
     // Use provided api_key, or keep existing one if not provided

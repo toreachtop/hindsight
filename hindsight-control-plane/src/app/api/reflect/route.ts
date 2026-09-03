@@ -25,11 +25,13 @@ export async function POST(request: NextRequest) {
     include_tool_calls,
     tags,
     tags_match,
+    tag_groups,
     apply_all_directives,
     max_tokens,
     fact_types,
     exclude_mental_models,
     exclude_mental_model_ids,
+    response_schema,
   } = body;
 
   const requestBody: any = {
@@ -37,11 +39,13 @@ export async function POST(request: NextRequest) {
     budget: budget || (thinking_budget ? "mid" : "low"),
     tags,
     tags_match,
+    tag_groups,
     apply_all_directives: apply_all_directives || undefined,
     max_tokens: max_tokens || undefined,
     fact_types: fact_types || undefined,
     exclude_mental_models: exclude_mental_models || undefined,
     exclude_mental_model_ids: exclude_mental_model_ids || undefined,
+    response_schema: response_schema || undefined,
   };
 
   // Add include options if specified

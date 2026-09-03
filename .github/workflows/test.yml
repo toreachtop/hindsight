@@ -25,24 +25,28 @@ jobs:
       cli: ${{ steps.filter.outputs.cli }}
       docker: ${{ steps.filter.outputs.docker }}
       helm: ${{ steps.filter.outputs.helm }}
-      docs: ${{ steps.filter.outputs.docs }}
+      doc-examples: ${{ steps.filter.outputs.doc-examples }}
       embed: ${{ steps.filter.outputs.embed }}
       all-npm: ${{ steps.filter.outputs.all-npm }}
       hindsight-all: ${{ steps.filter.outputs.hindsight-all }}
       integration-tests: ${{ steps.filter.outputs.integration-tests }}
       integrations-openclaw: ${{ steps.filter.outputs.integrations-openclaw }}
       integrations-ai-sdk: ${{ steps.filter.outputs.integrations-ai-sdk }}
+      integrations-eliza: ${{ steps.filter.outputs.integrations-eliza }}
       integrations-agent-framework: ${{ steps.filter.outputs.integrations-agent-framework }}
       integrations-composio: ${{ steps.filter.outputs.integrations-composio }}
       integrations-chat: ${{ steps.filter.outputs.integrations-chat }}
       integrations-claude-code: ${{ steps.filter.outputs.integrations-claude-code }}
+      integrations-coding-agents: ${{ steps.filter.outputs.integrations-coding-agents }}
       integrations-cline: ${{ steps.filter.outputs.integrations-cline }}
       integrations-codex: ${{ steps.filter.outputs.integrations-codex }}
       integrations-github-copilot: ${{ steps.filter.outputs.integrations-github-copilot }}
       integrations-continue: ${{ steps.filter.outputs.integrations-continue }}
       integrations-cursor-cli: ${{ steps.filter.outputs.integrations-cursor-cli }}
       integrations-zcode: ${{ steps.filter.outputs.integrations-zcode }}
+      integrations-agent-plugin: ${{ steps.filter.outputs.integrations-agent-plugin }}
       integrations-copilot-cli: ${{ steps.filter.outputs.integrations-copilot-cli }}
+      extensions-supabase-tenant: ${{ steps.filter.outputs.extensions-supabase-tenant }}
       integrations-crewai: ${{ steps.filter.outputs.integrations-crewai }}
       integrations-litellm: ${{ steps.filter.outputs.integrations-litellm }}
       integrations-pydantic-ai: ${{ steps.filter.outputs.integrations-pydantic-ai }}
@@ -116,12 +120,17 @@ jobs:
             - 'docker/**'
           helm:
             - 'helm/**'
-          docs:
-            - 'hindsight-docs/**'
-            - '*.md'
-            # Integration changes can add/rename integrations, which the docs
-            # build's integrations check validates against integrations.json.
-            - 'hindsight-integrations/**'
+          # The RUNNABLE samples only. This replaces a broad `docs` filter that also
+          # matched 'hindsight-docs/**', '*.md' and 'hindsight-integrations/**' — the
+          # last of those so an integration rename would be caught by the docs build's
+          # integrations check, except that build (build-docs) has no `if:` and runs
+          # unconditionally anyway. test-doc-examples was the filter's only consumer,
+          # and it executes every sample against a live LLM-backed server, so every
+          # integration and prose-only PR paid for four provider-credentialed runs that
+          # none of those files can affect.
+          doc-examples:
+            - 'hindsight-docs/examples/**'
+            - 'scripts/test-doc-examples.sh'
           embed:
             - 'hindsight-embed/**'
           all-npm:
@@ -136,6 +145,8 @@ jobs:
             - 'hindsight-integrations/openclaw/**'
           integrations-ai-sdk:
             - 'hindsight-integrations/ai-sdk/**'
+          integrations-eliza:
+            - 'hindsight-integrations/eliza/**'
           integrations-agent-framework:
             - 'hindsight-integrations/agent-framework/**'
           integrations-composio:
@@ -144,6 +155,8 @@ jobs:
             - 'hindsight-integrations/chat/**'
           integrations-claude-code:
             - 'hindsight-integrations/claude-code/**'
+          integrations-coding-agents:
+            - 'hindsight-integrations/coding-agents/**'
           integrations-cline:
             - 'hindsight-integrations/cline/**'
           integrations-codex:
@@ -156,6 +169,8 @@ jobs:
             - 'hindsight-integrations/cursor-cli/**'
           integrations-copilot-cli:
             - 'hindsight-integrations/copilot-cli/**'
+          extensions-supabase-tenant:
+            - 'hindsight-extensions/supabase-tenant/**'
           integrations-crewai:
             - 'hindsight-integrations/crewai/**'
           integrations-litellm:
@@ -186,6 +201,8 @@ jobs:
             - 'hindsight-integrations/zed/**'
           integrations-zcode:
             - 'hindsight-integrations/zcode/**'
+          integrations-agent-plugin:
+            - 'hindsight-integrations/agent-plugin/**'
           integrations-n8n:
             - 'hindsight-integrations/n8n/**'
           integrations-zapier:
@@ -472,6 +489,42 @@ jobs:
       working-directory: ./hindsight-integrations/openclaw
       run: ./scripts/smoke-test.sh
 
+  test-coding-agents:
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.integrations-coding-agents == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - uses: actions/setup-node@v6
+      with:
+        node-version: '22'
+        cache: npm
+        cache-dependency-path: hindsight-integrations/coding-agents/package-lock.json
+
+    - name: Install dependencies
+      working-directory: ./hindsight-integrations/coding-agents
+      run: npm ci
+
+    - name: Typecheck
+      working-directory: ./hindsight-integrations/coding-agents
+      run: npx tsc --noEmit
+
+    - name: Unit tests
+      working-directory: ./hindsight-integrations/coding-agents
+      run: npm test
+
+    - name: Build
+      working-directory: ./hindsight-integrations/coding-agents
+      run: npm run build
+
   test-claude-code-integration:
     needs: [detect-changes]
     if: >-
@@ -752,6 +805,29 @@ jobs:
       working-directory: ./hindsight-integrations/zcode
       run: uv run pytest tests -v
 
+  test-agent-plugin-integration:
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.integrations-agent-plugin == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+
+    - name: Validate Agent Plugin manifests
+      working-directory: ./hindsight-integrations/agent-plugin
+      run: python3 validate.py
+
   build-ai-sdk-integration:
     needs: [detect-changes]
     if: >-
@@ -814,6 +890,37 @@ jobs:
     - name: Run tests (Deno)
       working-directory: ./hindsight-integrations/ai-sdk
       run: npm run test:deno
+
+  build-eliza-integration:
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.integrations-eliza == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v6
+      with:
+        node-version: '22'
+
+    - name: Install dependencies
+      working-directory: ./hindsight-integrations/eliza
+      run: npm ci
+
+    - name: Run tests
+      working-directory: ./hindsight-integrations/eliza
+      run: npm test
+
+    - name: Build
+      working-directory: ./hindsight-integrations/eliza
+      run: npm run build
 
   test-opencode-integration:
     needs: [detect-changes]
@@ -1351,6 +1458,30 @@ jobs:
           hindsight-cli/target
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+    - name: Install cargo-about
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-about@0.9.1
+
+    - name: Verify cargo-about
+      run: cargo about --version
+
+    # cargo-about resolves the dependency graph for every target platform, so it
+    # needs crates this host never builds (e.g. the Android-only
+    # android_system_properties). Populate the registry first: `cargo fetch`
+    # without --target downloads for all targets, and Cargo.lock is not checked
+    # in, so nothing is cached from a previous step.
+    - name: Fetch crate sources for the license scan
+      working-directory: hindsight-cli
+      run: cargo fetch
+
+    - name: Generate and verify license manifest
+      working-directory: hindsight-cli
+      run: |
+        cargo about generate --offline --manifest-path Cargo.toml --config about.toml about.hbs --output-file /tmp/THIRD_PARTY_LICENSES.txt
+        test -s /tmp/THIRD_PARTY_LICENSES.txt
+        grep -Fq "THIRD-PARTY SOFTWARE LICENSES" /tmp/THIRD_PARTY_LICENSES.txt
+
     - name: Run unit tests
       working-directory: hindsight-cli
       run: cargo test
@@ -1494,28 +1625,39 @@ jobs:
     timeout-minutes: 30
     strategy:
       matrix:
+        # `smoke` decides which legs are loaded into the daemon and actually
+        # started. The full variants are skipped to save runner disk; cp-only
+        # is smoke tested despite being a full variant because the alpine
+        # image is small and it is the only leg that exercises the alpine Node
+        # runtime at all (it needs no LLM credentials - see NEEDS_LLM in
+        # docker/test-image.sh).
         include:
           - target: api-only
             name: api
             variant: full
+            smoke: false
             build_args: ""
           - target: api-only
             name: api-slim
             variant: slim
+            smoke: true
             build_args: |
               INCLUDE_LOCAL_MODELS=false
               PRELOAD_ML_MODELS=false
           - target: cp-only
             name: control-plane
             variant: full
+            smoke: true
             build_args: ""
           - target: standalone
             name: standalone
             variant: full
+            smoke: false
             build_args: ""
           - target: standalone
             name: standalone-slim
             variant: slim
+            smoke: true
             build_args: |
               INCLUDE_LOCAL_MODELS=false
               PRELOAD_ML_MODELS=false
@@ -1547,23 +1689,24 @@ jobs:
         target: ${{ matrix.target }}
         build-args: ${{ matrix.build_args }}
         push: false
-        load: ${{ matrix.variant == 'slim' }}
+        load: ${{ matrix.smoke }}
         tags: hindsight-${{ matrix.name }}:test
         # Removed GitHub Actions cache (type=gha) - it frequently returns 502 errors
         # causing buildx to fail with "failed to parse error response 502"
         # Build will be slower but more reliable
 
-    # Only test slim variants to save disk space (they're much smaller)
-    # Slim variants require external embedding providers
+    # Slim variants require external embedding providers; cp-only needs no
+    # credentials at all, so the credential step stays gated on the variant
+    # while the smoke test itself is gated on `smoke`.
     - name: Setup GCP credentials for smoke test
-      if: matrix.variant == 'slim'
+      if: matrix.variant == 'slim' && matrix.smoke
       run: |
         printf '%s' '${{ secrets.GCP_VERTEXAI_CREDENTIALS }}' > /tmp/gcp-credentials.json
         PROJECT_ID=$(jq -r '.project_id' /tmp/gcp-credentials.json)
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
     - name: Smoke test - verify container starts
-      if: matrix.variant == 'slim'
+      if: matrix.smoke
       env:
         HINDSIGHT_API_LLM_PROVIDER: vertexai
         HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
@@ -1675,6 +1818,128 @@ jobs:
       # composes cleanly with the `-n 8 --dist loadgroup` baked into addopts.
       run: uv run --with pytest-split pytest tests -v -m "not hs_llm_mat and not hs_llm_core" --splits 3 --group ${{ matrix.shard }}
 
+  test-api-free-threaded:
+    needs: [detect-changes]
+    # Deliberately NOT gated on `has_secrets`: this job runs the mock LLM and a
+    # deterministic embedder, so it needs no provider credentials and therefore also
+    # runs on fork PRs — which skip every secret-gated test-api job entirely.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.core == 'true' ||
+      needs.detect-changes.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    name: test-api (free-threaded 3.14)
+    env:
+      HINDSIGHT_API_LLM_PROVIDER: mock
+      # Not a repository secret — Actions provides it to every run, forks included —
+      # so this keeps the job runnable on fork PRs. The github-copilot provider reads
+      # it to avoid looking for CLI account metadata that no runner has.
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # strict is the default on a free-threaded build; set explicitly so the intent
+      # of this job is visible in the workflow rather than only in the code.
+      HINDSIGHT_API_FREE_THREADING: strict
+      # SQLAlchemy's Cython extensions do not declare free-threading support. They
+      # currently have no cp314t wheel so the pure-Python fallback is automatic, but
+      # pin it: the day a cp314t wheel ships, this job would otherwise start running
+      # with the GIL quietly re-enabled.
+      DISABLE_SQLALCHEMY_CEXT_RUNTIME: "1"
+
+    services:
+      # For the image smoke test at the end of the job. The pytest run above uses the
+      # embedded pg0, not this.
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: hindsight
+          POSTGRES_PASSWORD: hindsight
+          POSTGRES_DB: hindsight
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U hindsight"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+        prune-cache: false
+
+    - name: Set up free-threaded Python 3.14
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.14t'
+
+    - name: Create the virtualenv
+      working-directory: ./hindsight-api-slim
+      run: uv venv --python "$(which python)" .venv-ft
+
+    - name: Install dependencies
+      working-directory: ./hindsight-api-slim
+      # `uv pip install` rather than `uv sync --frozen`: uv.lock pins the resolution
+      # for the default interpreter, and this one resolves different wheels.
+      #
+      # No --override is needed any more: quicktok left in #4022 and orjson in #4040,
+      # and everything remaining publishes cp3XXt wheels.
+      #
+      # local-ml is deliberately excluded. Importing sentence_transformers re-enables
+      # the GIL, so a process that installs it cannot stay free-threaded; the tests
+      # that need local models skip themselves (see tests/conftest.py).
+      env:
+        VIRTUAL_ENV: .venv-ft
+      run: uv pip install -e ".[embedded-db]" --group dev
+
+
+    - name: Assert the interpreter is genuinely free-threaded
+      working-directory: ./hindsight-api-slim
+      # Fails the job before a single test runs if the build is not free-threaded or a
+      # dependency has already taken the GIL back, so that shows up as its own red step
+      # rather than as a confusing mass of downstream failures.
+      run: |
+        ./.venv-ft/bin/python -c "
+        import sys, sysconfig
+        assert sysconfig.get_config_var('Py_GIL_DISABLED'), 'not a free-threaded build'
+        assert not sys._is_gil_enabled(), 'the GIL is already enabled at startup'
+        import hindsight_api.api.http
+        assert not sys._is_gil_enabled(), 'importing the API re-enabled the GIL'
+        print('free-threaded:', sys.version)
+        "
+
+    - name: Run tests
+      working-directory: ./hindsight-api-slim
+      # Deliberately NOT run with the GIL warning promoted to an error. The suite
+      # imports LiteLLM on purpose to test that provider, and LiteLLM pulls in
+      # fastuuid, which has no free-threaded build — so a suite-wide filter fails
+      # ~50 tests for doing exactly what they are meant to do.
+      #
+      # What matters is that the SERVER never takes the GIL, and that is asserted
+      # where it belongs: the step above imports the whole API under the fatal
+      # filter, tests/test_free_threading.py re-checks it in a subprocess, and the
+      # image build and smoke test assert it again.
+      run: |
+        ./.venv-ft/bin/python -m pytest tests -v \
+          -m "not hs_llm_mat and not hs_llm_core"
+
+    - name: Build the free-threaded image
+      # Its own Dockerfile, not a target of the standalone one: different interpreter,
+      # different resolution, no control plane, no local ML. The build itself asserts
+      # the GIL is off after importing the whole API, so a mis-tagged image fails here.
+      run: docker build -f docker/standalone/Dockerfile.freethreaded -t hindsight-api:py3.14t .
+
+    - name: Smoke test the free-threaded image
+      # Starts the image against the Postgres service and a stub embedder, exercises
+      # retain and recall, and asserts the SERVER process still has the GIL disabled —
+      # the failure this tag exists to prevent is silent, so it has to be asserted.
+      run: ./docker/freethreaded-smoke.sh hindsight-api:py3.14t "postgresql://hindsight:hindsight@127.0.0.1:5432/hindsight"
+
   test-api-llm-core:
     needs: [detect-changes]
     if: >-
@@ -1690,6 +1955,11 @@ jobs:
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
       HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      # The real-LLM delta/retraction/cache evals gate on this flag *and* a key. The
+      # key was already set here, so they sat skipped and the mental-model delta path —
+      # the one that hands a provider a schema it has to accept — had no end-to-end
+      # coverage anywhere. Found while landing the structured-output change (#3937).
+      HINDSIGHT_RUN_GEMINI_EVALS: "1"
 
     steps:
     - uses: actions/checkout@v6
@@ -1737,7 +2007,17 @@ jobs:
 
     - name: Run core LLM tests
       working-directory: ./hindsight-api-slim
-      run: uv run pytest tests -v -m "hs_llm_core" --timeout 600
+      # --reruns, and ONLY on this job. Every test here asserts what a model chose to
+      # do — a judge verdict, whether the agent called done() rather than being forced,
+      # whether a summary kept a detail — so a single run's failure does not separate a
+      # regression from the model landing differently. It shows: this job has failed on
+      # a *different* test in most recent runs (5 distinct ones across 2 runs of #3982
+      # alone), which makes a red here carry no signal at all. Two reruns keep a real
+      # regression red — it reproduces — while a coin-flip settles.
+      #
+      # Deliberately NOT applied to the deterministic shards (test-api): there a rerun
+      # would hide exactly the races those tests exist to catch.
+      run: uv run pytest tests -v -m "hs_llm_core" --timeout 600 --reruns 2 --reruns-delay 5
 
   test-api-llm-acceptance:
     needs: [detect-changes]
@@ -3631,6 +3911,53 @@ jobs:
       working-directory: ./hindsight-integrations/copilot-cli
       run: uv run pytest tests -v
 
+  test-extension-supabase-tenant:
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.extensions-supabase-tenant == 'true' ||
+      needs.detect-changes.outputs.core == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+        prune-cache: false
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+
+    # No --frozen: the lock is not checked in, because tool.uv.sources resolves
+    # hindsight-api-slim from the local checkout and its dependency tree moves
+    # with core.
+    - name: Install dependencies
+      working-directory: ./hindsight-extensions/supabase-tenant
+      run: uv sync
+
+    - name: Run tests
+      working-directory: ./hindsight-extensions/supabase-tenant
+      run: uv run pytest tests -v
+
+    # The Dockerfile IS the distribution mechanism — its final `import` step is
+    # the only thing proving the extension is reachable from the interpreter the
+    # server runs. Build it from the repo root, where the sources are in context.
+    - name: Build the extension image
+      run: |
+        docker build \
+          -f hindsight-extensions/supabase-tenant/Dockerfile \
+          --build-arg HINDSIGHT_IMAGE=ghcr.io/vectorize-io/hindsight:latest-slim \
+          -t hindsight-with-supabase .
+
   test-crewai-integration:
     needs: [detect-changes]
     if: >-
@@ -4489,6 +4816,73 @@ jobs:
           fi
         done || true
 
+  # Compatibility gate against hermes-agent's *main* branch.
+  #
+  # `hermes memory setup` installs `hindsight-all` into Hermes' own venv to run
+  # memory in local_embedded mode, and Hermes exact-pins every direct dependency
+  # (`==X.Y.Z`) as a deliberate supply-chain policy — they will not loosen a pin
+  # for us. So any version range Hindsight declares that excludes one of their
+  # pins makes the two impossible to co-install for every Hermes user on
+  # embedded memory. That was #3251: our `cryptography>=48.0.1` / `pillow>=12.3.0`
+  # against their `==46.0.7` / `==12.2.0`, which left `pip check` permanently
+  # broken. Both sides bump on their own schedule, so this needs a standing gate
+  # rather than a one-off fix; tracking main surfaces the next collision while
+  # it is still cheap to fix on either side.
+  #
+  # Deliberately not gated on has_secrets — the resolution, wiring, runtime and
+  # daemon-boot checks need no credentials, so this runs on fork PRs too. Only
+  # retain/recall need an LLM and the script skips them when no key is present.
+  test-hermes-compat:
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.core == 'true' ||
+      needs.detect-changes.outputs.embed == 'true' ||
+      needs.detect-changes.outputs.hindsight-all == 'true' ||
+      needs.detect-changes.outputs.clients-python == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+        prune-cache: false
+
+    # hindsight-all pulls the local-ml extra, so the embedded daemon can load
+    # sentence-transformers models. Cache them like the test-embed job does.
+    - name: Cache HuggingFace models
+      uses: actions/cache@v5
+      with:
+        path: ~/.cache/huggingface
+        key: ${{ runner.os }}-huggingface-hermes-compat-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-huggingface-hermes-compat-
+          ${{ runner.os }}-huggingface-
+
+    - name: Run Hermes compatibility test
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+      run: ./scripts/test-hermes-compat.sh
+
+    - name: Collect embedded daemon logs on failure
+      if: failure()
+      run: |
+        for f in ~/.hindsight/profiles/hermes-ci*.log ~/.hindsight/profiles/hermes-ci*.stderr.log; do
+          if [ -f "$f" ]; then
+            echo "=== $f ==="
+            cat "$f"
+          fi
+        done || true
+
   test-hindsight-all:
     needs: [detect-changes]
     if: >-
@@ -4590,7 +4984,7 @@ jobs:
       needs.detect-changes.outputs.clients-python == 'true' ||
       needs.detect-changes.outputs.clients-go == 'true' ||
       needs.detect-changes.outputs.cli == 'true' ||
-      needs.detect-changes.outputs.docs == 'true' ||
+      needs.detect-changes.outputs.doc-examples == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -4994,13 +5388,26 @@ jobs:
           exit 0
         fi
 
-        echo "Checking OpenAPI compatibility against base branch: $BASE_BRANCH"
+        # Compare against the point this branch was cut from, NOT the live tip of
+        # the base branch. Using the tip reports every endpoint main has gained
+        # since the branch was cut as "removed by this PR" — a false positive that
+        # fails PRs which touch no spec at all, and whose only cure is an unrelated
+        # rebase. The merge-base answers the question the check actually asks:
+        # did *this branch* remove something?
+        MERGE_BASE="$(git merge-base "origin/$BASE_BRANCH" HEAD)"
 
-        # Extract the old OpenAPI spec from base branch
-        git show "origin/$BASE_BRANCH:hindsight-docs/static/openapi.json" > /tmp/old-openapi.json
+        if [ -z "$MERGE_BASE" ]; then
+          echo "⚠️  Warning: Could not determine merge-base with $BASE_BRANCH. Skipping compatibility check."
+          exit 0
+        fi
+
+        echo "Checking OpenAPI compatibility against $BASE_BRANCH merge-base: $MERGE_BASE"
+
+        # Extract the old OpenAPI spec from the merge-base
+        git show "$MERGE_BASE:hindsight-docs/static/openapi.json" > /tmp/old-openapi.json
 
         if [ ! -s /tmp/old-openapi.json ]; then
-          echo "⚠️  Warning: Could not find OpenAPI spec in base branch. Skipping compatibility check."
+          echo "⚠️  Warning: Could not find OpenAPI spec at the merge-base. Skipping compatibility check."
           exit 0
         fi
 
@@ -5042,6 +5449,83 @@ jobs:
         cd hindsight-dev
         uv run cli-coverage-check
 
+  # The wrapper clients (hindsight_client.py / src/index.ts) are hand-written
+  # convenience layers over the generated SDKs, so nothing regenerates them when
+  # the API gains a field. client-coverage-check has existed for that, but had no
+  # job: it sat red on main with reflect.apply_all_directives missing from both
+  # wrappers, and the bank-config surface had drifted to 22 settings reachable
+  # from neither. See #4029.
+  check-client-coverage:
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.core == 'true' ||
+      needs.detect-changes.outputs.clients-ts == 'true' ||
+      needs.detect-changes.outputs.clients-python == 'true' ||
+      needs.detect-changes.outputs.dev == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+
+    - name: Install hindsight-dev dependencies
+      run: |
+        cd hindsight-dev && uv sync --frozen --index-strategy unsafe-best-match
+
+    - name: Check client wrappers cover every request param and bank config field
+      run: |
+        cd hindsight-dev
+        uv run client-coverage-check
+
+  # hindsight-dev/tests had no job of its own, so nothing ran it: the benchmark
+  # harness was only exercised by the nightly Performance Tests workflow, where a
+  # plain construction bug in the answer/judge LLM config surfaced as a red
+  # benchmark hours later instead of on the PR that introduced it.
+  test-dev:
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.core == 'true' ||
+      needs.detect-changes.outputs.dev == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+
+    - name: Install hindsight-dev dependencies
+      run: |
+        cd hindsight-dev && uv sync --frozen --extra test --index-strategy unsafe-best-match
+
+    - name: Run hindsight-dev tests
+      working-directory: hindsight-dev
+      run: uv run pytest tests/ -v
+
   # Report CI status back to the PR for pull_request_review events.
   # GitHub does not automatically link pull_request_review check runs to the PR,
   # so we create a commit status on the PR head SHA and post a comment.
@@ -5061,6 +5545,7 @@ jobs:
       - test-codex-integration
       - test-cursor-cli-integration
       - test-zcode-integration
+      - test-agent-plugin-integration
       - build-ai-sdk-integration
       - test-ai-sdk-integration-deno
       - test-opencode-integration
@@ -5101,6 +5586,7 @@ jobs:
       - test-flowise-integration
       - test-obsidian-integration
       - test-agent-framework-integration
+      - test-extension-supabase-tenant
       - test-crewai-integration
       - test-langgraph-integration
       - test-superagent-integration
@@ -5116,6 +5602,7 @@ jobs:
       - test-embed
       - test-embed-windows
       - verify-embed-control-center-bundle
+      - test-hermes-compat
       - test-hindsight-all
       - test-hindsight-agent-sdk
       - test-claude-agent-sdk-integration
@@ -5124,6 +5611,7 @@ jobs:
       - verify-generated-files
       - check-openapi-compatibility
       - check-cli-coverage
+      - check-client-coverage
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
