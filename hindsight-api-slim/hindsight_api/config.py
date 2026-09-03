@@ -405,6 +405,8 @@ ENV_EMBEDDINGS_ONNX_BATCH_SIZE = "HINDSIGHT_API_EMBEDDINGS_ONNX_BATCH_SIZE"
 ENV_EMBEDDINGS_ONNX_CPU_MEM_ARENA = "HINDSIGHT_API_EMBEDDINGS_ONNX_CPU_MEM_ARENA"
 ENV_EMBEDDINGS_TEI_URL = "HINDSIGHT_API_EMBEDDINGS_TEI_URL"
 ENV_EMBEDDINGS_TEI_BATCH_SIZE = "HINDSIGHT_API_EMBEDDINGS_TEI_BATCH_SIZE"
+ENV_EMBEDDINGS_OLLAMA_MODEL = "HINDSIGHT_API_EMBEDDINGS_OLLAMA_MODEL"
+ENV_EMBEDDINGS_OLLAMA_BASE_URL = "HINDSIGHT_API_EMBEDDINGS_OLLAMA_BASE_URL"
 ENV_EMBEDDINGS_OPENAI_API_KEY = "HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY"
 ENV_EMBEDDINGS_OPENAI_MODEL = "HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL"
 ENV_EMBEDDINGS_OPENAI_BASE_URL = "HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL"
@@ -1075,6 +1077,8 @@ DEFAULT_EMBEDDINGS_ONNX_BATCH_SIZE = 32
 DEFAULT_EMBEDDINGS_ONNX_CPU_MEM_ARENA = False  # Disable ONNX CPU memory arena to bound RSS
 DEFAULT_EMBEDDINGS_OPENAI_MODEL = "text-embedding-3-small"
 DEFAULT_EMBEDDINGS_OPENAI_BATCH_SIZE = 100
+DEFAULT_EMBEDDINGS_OLLAMA_MODEL = "nomic-embed-text"
+DEFAULT_EMBEDDINGS_OLLAMA_BASE_URL = "http://localhost:11434"
 # Texts per TEI /embed request, and the unit the client fans out over (see
 # DEFAULT_EMBEDDINGS_MAX_CONCURRENT_REQUESTS). 32 is also TEI's own default
 # --max-client-batch-size, and that is a hard validation error rather than a soft cap, so
@@ -2658,6 +2662,8 @@ class HindsightConfig:
     embeddings_onnx_batch_size: int
     embeddings_onnx_cpu_mem_arena: bool
     embeddings_tei_url: str | None
+    embeddings_ollama_model: str
+    embeddings_ollama_base_url: str
     embeddings_openai_base_url: str | None
     embeddings_cohere_api_key: str | None
     embeddings_cohere_model: str
@@ -3784,6 +3790,10 @@ class HindsightConfig:
             ).lower()
             == "true",
             embeddings_tei_url=os.getenv(ENV_EMBEDDINGS_TEI_URL),
+            embeddings_ollama_model=os.getenv(ENV_EMBEDDINGS_OLLAMA_MODEL, DEFAULT_EMBEDDINGS_OLLAMA_MODEL),
+            embeddings_ollama_base_url=os.getenv(
+                ENV_EMBEDDINGS_OLLAMA_BASE_URL, DEFAULT_EMBEDDINGS_OLLAMA_BASE_URL
+            ),
             embeddings_openai_base_url=os.getenv(ENV_EMBEDDINGS_OPENAI_BASE_URL) or None,
             embeddings_openai_batch_size=_parse_positive_int(
                 ENV_EMBEDDINGS_OPENAI_BATCH_SIZE,
